@@ -1,0 +1,5 @@
+# Force LF everywhere. docker-compose.yaml embeds a shell script and a Node
+# source file that are written into the container verbatim; if git checked them
+# out with CRLF on a Windows clone, the trailing carriage returns would break
+# the bootstrap inside the container.
+* text=auto eol=lf

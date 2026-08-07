@@ -1,0 +1,16 @@
+# Reference material and superseded files, kept locally but not published.
+# claude-max-api-proxy is a third-party repository that inspired this project;
+# none of its code is used here, so it must not be redistributed from here.
+claude-max-api-proxy/
+ollama-bridge.js
+
+# Test scratch space
+test/.tmp/
+
+# Local editor / assistant settings
+.claude/
+
+node_modules/
+*.log
+.DS_Store
+Thumbs.db

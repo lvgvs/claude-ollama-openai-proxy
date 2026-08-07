@@ -1,0 +1,15 @@
+{
+  "name": "claude-code-cli-proxy",
+  "version": "1.0.0",
+  "description": "Exposes the Claude Code CLI as an Ollama-compatible and OpenAI-compatible API, in a single docker-compose file",
+  "type": "module",
+  "private": true,
+  "license": "MIT",
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "build": "node scripts/build-compose.mjs",
+    "test": "node test/gateway.test.mjs && node test/auth.test.mjs && node test/resume-fallback.test.mjs && node test/prune.test.mjs && node test/compose.test.mjs"
+  }
+}
