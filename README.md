@@ -260,6 +260,8 @@ npm test
 
 The test suite runs the gateway against a stub CLI that speaks the same stream-json protocol, so no API quota is consumed. It covers protocol translation, streaming, tool calling, image input, effort selection, session continuity, the resume-failure fallback, transcript pruning, and the fidelity of the source embedded in the compose file.
 
+Most of it is plain Node and runs anywhere. The compose suite additionally executes the bootstrap script embedded in the YAML, which needs a real shell — on Windows run the tests from Git Bash, or point `TEST_BASH` at a bash binary. Note that on Windows the `bash` on `PATH` is often `C:\Windows\System32\bash.exe`, the WSL launcher, which fails when no distribution is installed; the suite detects this and reports those three checks as skipped instead of failed. The check that matters most — that the source survives the YAML block scalar byte for byte — is pure JavaScript and always runs.
+
 Transcript pruning deletes files, so it has its own suite. The checks that matter most are the negative ones: credentials, settings, recent transcripts and non-transcript files must all survive.
 
 ---

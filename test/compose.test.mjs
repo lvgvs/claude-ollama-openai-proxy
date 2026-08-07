@@ -12,7 +12,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { spawnSync } from "node:child_process";
-import { check, section, summary, ROOT, GATEWAY } from "./helpers.mjs";
+import { check, skip, section, summary, ROOT, GATEWAY } from "./helpers.mjs";
 
 // The sandbox lives in the system temp directory rather than the repository,
 // because the repository path may contain spaces and the extracted shell
@@ -65,6 +65,43 @@ const embedded = bl.slice(gs + 1, ge).join("\n");
 const original = fs.readFileSync(GATEWAY, "utf8").replace(/\r\n/g, "\n").replace(/\n$/, "");
 check("embedded source matches the original", embedded === original, "embedded=" + embedded.length + " original=" + original.length);
 
+/*
+ * The "bash" on PATH is not always a usable shell. On Windows it commonly
+ * resolves to C:\Windows\System32\bash.exe, the WSL launcher, which exits 1
+ * with an empty stderr when no distribution is installed - indistinguishable
+ * from the script itself failing. Probe the candidates and take the first that
+ * actually runs, preferring Git Bash on Windows.
+ */
+function findBash() {
+  const usable = (bin) => {
+    const probe = spawnSync(bin, ["-c", "echo ready"], { encoding: "utf8" });
+    return probe.status === 0 && (probe.stdout || "").includes("ready");
+  };
+  // An explicit TEST_BASH is authoritative. Falling back to a different shell
+  // would let someone believe they had tested with the one they named.
+  if (process.env.TEST_BASH) return usable(process.env.TEST_BASH) ? process.env.TEST_BASH : null;
+
+  const candidates = [];
+  if (process.platform === "win32") {
+    const git = spawnSync("git", ["--exec-path"], { encoding: "utf8" });
+    // --exec-path points at <root>/mingw64/libexec/git-core
+    if (git.status === 0 && git.stdout.trim()) {
+      candidates.push(path.join(path.resolve(git.stdout.trim(), "..", "..", ".."), "bin", "bash.exe"));
+    }
+    candidates.push("C:/Program Files/Git/bin/bash.exe");
+  }
+  candidates.push("bash");
+  for (const candidate of candidates) {
+    if (usable(candidate)) return candidate;
+  }
+  return null;
+}
+
+const BASH = findBash();
+const NO_BASH = process.env.TEST_BASH
+  ? "TEST_BASH is set but does not run: " + process.env.TEST_BASH
+  : "no working bash on this machine (install Git for Windows, or point TEST_BASH at one)";
+
 section("Running the embedded script");
 const fakeHome = path.join(SANDBOX, "home", "node").replace(/\\/g, "/");
 
@@ -82,26 +119,38 @@ const runnable = bl
 
 const scriptPath = path.join(SANDBOX, "entrypoint.sh");
 fs.writeFileSync(scriptPath, runnable, "utf8");
-const r = spawnSync("bash", [scriptPath.replace(/\\/g, "/")], { encoding: "utf8" });
-check("the script runs without error", r.status === 0, "code=" + r.status + " " + (r.stderr || "").slice(0, 300));
 
-const producedGw = path.join(fakeHome, "claude-gateway.mjs");
-check("claude-gateway.mjs was written", fs.existsSync(producedGw));
-if (fs.existsSync(producedGw)) {
-  const produced = fs.readFileSync(producedGw, "utf8").replace(/\r\n/g, "\n").replace(/\n$/, "");
-  check("the written file matches the original", produced === original, "produced=" + produced.length + " original=" + original.length);
-  const chk = spawnSync(process.execPath, ["--check", producedGw], { encoding: "utf8" });
-  check("the written file is valid javascript", chk.status === 0, chk.stderr);
-}
+/*
+ * Only this last stretch needs a shell. The guarantee that matters most - that
+ * the source survives the YAML block scalar byte for byte - is checked above
+ * in pure JavaScript, so it still runs on a machine without bash.
+ */
+if (!BASH) {
+  skip("the script runs without error", NO_BASH);
+  skip("claude-gateway.mjs was written", NO_BASH);
+  skip("start.sh was written", NO_BASH);
+} else {
+  const r = spawnSync(BASH, [scriptPath.replace(/\\/g, "/")], { encoding: "utf8" });
+  check("the script runs without error", r.status === 0, "code=" + r.status + " " + (r.stderr || "").slice(0, 300));
 
-const producedStart = path.join(fakeHome, "start.sh");
-check("start.sh was written", fs.existsSync(producedStart));
-if (fs.existsSync(producedStart)) {
-  const s = fs.readFileSync(producedStart, "utf8");
-  check("start.sh begins with a shebang", s.startsWith("#!/bin/bash"), s.slice(0, 30));
-  check("start.sh ends by launching node", s.includes("exec node " + fakeHome + "/claude-gateway.mjs"), s.slice(-120));
-  const sc = spawnSync("bash", ["-n", producedStart.replace(/\\/g, "/")], { encoding: "utf8" });
-  check("start.sh is valid bash", sc.status === 0, sc.stderr);
+  const producedGw = path.join(fakeHome, "claude-gateway.mjs");
+  check("claude-gateway.mjs was written", fs.existsSync(producedGw));
+  if (fs.existsSync(producedGw)) {
+    const produced = fs.readFileSync(producedGw, "utf8").replace(/\r\n/g, "\n").replace(/\n$/, "");
+    check("the written file matches the original", produced === original, "produced=" + produced.length + " original=" + original.length);
+    const chk = spawnSync(process.execPath, ["--check", producedGw], { encoding: "utf8" });
+    check("the written file is valid javascript", chk.status === 0, chk.stderr);
+  }
+
+  const producedStart = path.join(fakeHome, "start.sh");
+  check("start.sh was written", fs.existsSync(producedStart));
+  if (fs.existsSync(producedStart)) {
+    const s = fs.readFileSync(producedStart, "utf8");
+    check("start.sh begins with a shebang", s.startsWith("#!/bin/bash"), s.slice(0, 30));
+    check("start.sh ends by launching node", s.includes("exec node " + fakeHome + "/claude-gateway.mjs"), s.slice(-120));
+    const sc = spawnSync(BASH, ["-n", producedStart.replace(/\\/g, "/")], { encoding: "utf8" });
+    check("start.sh is valid bash", sc.status === 0, sc.stderr);
+  }
 }
 
 section("Compose structure");

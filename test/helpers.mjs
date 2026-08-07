@@ -10,6 +10,17 @@ export const FAKE_CLI = path.join(HERE, "fake-claude.mjs");
 
 let pass = 0;
 let fail = 0;
+let skipped = 0;
+
+/*
+ * For checks that need something this machine may not have. A skip is neither
+ * a pass nor a failure: it records that the check could not be attempted, so
+ * it gets its own line rather than quietly inflating either count.
+ */
+export function skip(name, reason) {
+  skipped++;
+  console.log("  skip " + name + (reason ? "  -> " + reason : ""));
+}
 
 export function check(name, condition, detail) {
   if (condition) {
@@ -27,7 +38,7 @@ export function section(title) {
 
 export function summary(serverLog) {
   console.log("\n=======================================");
-  console.log("passed: " + pass + "   failed: " + fail);
+  console.log("passed: " + pass + "   failed: " + fail + (skipped ? "   skipped: " + skipped : ""));
   console.log("=======================================");
   if (fail && serverLog) console.log("\nserver log:\n" + serverLog.slice(-3000));
   return fail;

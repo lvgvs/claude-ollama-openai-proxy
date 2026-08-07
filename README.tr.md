@@ -260,6 +260,8 @@ npm test
 
 Test paketi, ağ geçidini aynı stream-json protokolünü konuşan sahte bir CLI'ya karşı çalıştırır, dolayısıyla hiç API kotası harcanmaz. Protokol çevirisini, akışı, function calling'i, görsel girdiyi, efor seçimini, oturum devamlılığını, resume başarısızlığındaki yedek yolu, kayıt temizliğini ve compose dosyasına gömülen kaynağın birebirliğini kapsar.
 
+Paketin büyük kısmı düz Node ve her yerde çalışır. Compose paketi ayrıca YAML'a gömülü açılış scriptini de çalıştırır; bunun için gerçek bir kabuk gerekir — Windows'ta testleri Git Bash içinden çalıştırın ya da `TEST_BASH` değişkenini bir bash'e yönlendirin. Windows'ta `PATH` üzerindeki `bash` çoğu zaman WSL başlatıcısı olan `C:\Windows\System32\bash.exe`'dir ve kurulu dağıtım yoksa hata verir; paket bunu algılayıp o üç kontrolü başarısız değil, atlandı olarak raporlar. En kritik kontrol — kaynağın YAML blok değeri içinden bayt bayt aynı çıkması — saf JavaScript'tir ve her zaman çalışır.
+
 Kayıt temizliği dosya sildiği için kendi test paketine sahip. En önemli kontroller olumsuz olanlar: oturum bilgisi, ayarlar, yeni kayıtlar ve kayıt olmayan dosyaların hepsi hayatta kalmalı.
 
 ---
