@@ -129,6 +129,8 @@ Canlı sayaçlar — konuşma devamlılığının çalışıp çalışmadığı 
 curl -sS http://MAKINE_IP:3456/v1/usage
 ```
 
+Buradaki iki sayıyı birlikte okumak gerekir. `session.hitRate`, bir turun tüm geçmişi yeniden oynatmak yerine mevcut konuşmayı ne sıklıkta sürdürdüğünü; `tokens.cacheWrite` ise cache'ten okumak yerine cache'e ne kadar yazıldığını gösterir. Düşük isabet oranının yanındaki büyük bir `cacheWrite`, geçmişin her turda yeniden gönderilip yeniden cache'lendiği anlamına gelir — pahalı olan bozulma biçimi budur ve cache yazımı düz girdiden daha yüksek ücretlendirilir. Ölçek fikri vermesi için: Claude Code 2.1.224'e karşı ölçülen tek satırlık bir istek 2 girdi token'ı ve 3301 cache oluşturma token'ı bildirdi; tamamı CLI'ın kendi sistem prompt'u.
+
 ---
 
 ## İstemci bağlama
@@ -180,6 +182,8 @@ Ollama istemcileri bunun yerine `"options": { "reasoning_effort": "max" }` kulla
 
 Her model her seviyeyi desteklemez, ama desteklenmeyen bir seviye **hata vermez** — sessizce kırpılır ya da yok sayılır. Bu yüzden listedeki her kombinasyon güvenle durabilir.
 
+**Eforun bedeli.** Yüksek seviye daha fazla düşünme satın alır ve düşünme çıktı olarak faturalanır. `opus:max` mevcut en pahalı kombinasyon ve bir açılır listede seçili bırakılıp unutulması çok kolay. Bu senin için önemliyse `/v1/usage`'ı takip et.
+
 ---
 
 ## Çalışanlar
@@ -188,6 +192,7 @@ Her model her seviyeyi desteklemez, ama desteklenmeyen bir seviye **hata vermez*
 - **Aboneliğinin eriştiği tüm Claude modelleri**, takma adla ya da tam adla
 - **Efor seçimi**, istek bazında ya da model listesinden
 - **Function calling**, hem OpenAI hem Ollama biçiminde; araç sonuçları konuşmaya geri besleniyor
+- **Düşünme (thinking) ayrı alanda teslim ediliyor**: OpenAI tarafında `reasoning_content`, Ollama tarafında `message.thinking`. Cevabın içine asla karışmıyor; alanı tanımayan istemci onu yok sayar.
 - **Görsel girdi** (png, jpeg, gif, webp), gerçek görsel bloğu olarak iletiliyor
 - **Konuşma devamlılığı** — mesaj geçmişinin parmak izi alınıp Claude Code oturumuna eşleniyor, böylece her turda yalnızca yeni mesaj gönderiliyor. Bu, prompt caching'i devreye sokar; uzun sohbetlerde gecikmeyi ve kota tüketimini belirgin şekilde düşürür.
 - **Yerleşik araçlar kapalı**, istemci metni konteynerde komut çalıştıramaz
@@ -197,12 +202,15 @@ Her model her seviyeyi desteklemez, ama desteklenmeyen bir seviye **hata vermez*
 - **Embedding.** Claude Code CLI vektör üretemez. `/api/embeddings` ve `/v1/embeddings` sessizce sıfır döndürmek yerine açıklamalı bir `501` döner. İstemcinin kendi embedding motorunu kullan.
 - **Uzak görsel adresleri.** Yalnızca base64 ve `data:` adresleri kabul edilir. Konteyner içinden rastgele adres çekmek bir SSRF yüzeyi açacağı için bilerek yapılmıyor; öyle istekler düz metne düşer ve logda uyarı bırakır.
 - **`temperature`, `top_p`, `num_predict` ve benzeri örnekleme parametreleri.** CLI bunları kabul etmiyor, dolayısıyla yok sayılıyorlar.
-- **Yerleşik function calling.** CLI'da böyle bir arayüz yok; araç şemaları sistem prompt'una katı bir sözleşmeyle enjekte ediliyor ve cevap geri ayrıştırılıyor. Pratikte güvenilir çalışıyor ama garanti değil; ayrıştırılamayan çıktı normal metin sayılıyor.
+- **Yerleşik function calling.** CLI'da böyle bir arayüz yok; araç şemaları sistem prompt'una katı bir sözleşmeyle enjekte ediliyor ve cevap geri ayrıştırılıyor. Modeller bu sözleşmeyi düzenli olarak çiğniyor — çağrıdan önce anlatım yazıyor, JSON'u kod bloğuna sarıyor, sonrasında yazmaya devam ediyor — bu yüzden ayrıştırıcı hepsini kabul ediyor ve sondaki uydurma kısmı atıyor. Pratikte güvenilir çalışıyor ama garanti değil; yine de ayrıştırılamayan çıktı normal metin sayılıyor.
+- **Modeli düzgün biçimde susturmak.** Stop-sequence yok; model araç çağrısını yazdıktan sonra ona "dur" diyen bir şey kalmıyor ve devam edip araç sonuçlarını kendi uyduruyor. Bu metin atılıyor, üstelik varsayılan olarak tam çağrı okunur okunmaz CLI süreci sonlandırıldığı için hiç üretilmiyor — bkz. `TOOL_CALL_EARLY_STOP`.
 - **Çok kullanıcı özellikleri.** Sayaç, kota, istemci yalıtımı yok.
 - **Yatay ölçekleme.** Tek konteyner, istek başına tek CLI süreci.
 
 ## Bilinen pürüzler
 
+- **Uzun bir mesaj modele ortası eksik ulaşabilir.** Ağ geçidi hiçbir yerde kırpma yapmaz — ama modelin context penceresini keşfedemeyen Ollama istemcileri küçük bir varsayılan (çoğunlukla 2048 ya da 4096) kabul edip konuşmayı kendileri kırpar, genelde ortadan atarak. Context uzunluğu artık istemcilerin baktığı bilinen her yerde ilan ediliyor (`/api/show` içinde `parameters` ve `model_info`, `/api/tags` içinde `details`, `/v1/models` içinde `context_window` / `max_model_len`) ve `CONTEXT_LENGTH` bu değeri belirliyor. Ama bir istemcinin bunlardan herhangi birini okuduğunun garantisini bu taraf veremez. Uzun mesajlar hâlâ yarım cevaplanıyorsa `DEBUG` açıp `body: N bytes` satırını gönderdiğin boyutla karşılaştır: istek zaten kısa geldiyse kırpan istemcidir ve çözüm istemcinin ayarlarındadır.
+- **`TOOL_CALL_EARLY_STOP` yeni ve varsayılanı açık.** Araç çağrısı tamamlanır tamamlanmaz CLI'ı sonlandırmak, modelin araç sonuçlarını uydurmasını engelliyor — boşa giden çıktının büyük kısmı oradan geliyordu. Bu davranışı taklit eden bir stub'a karşı test edildi, uzun süren gerçek bir sohbete karşı değil. Araç kullanan sohbetlerde devamlılık bozulmaya başlarsa `"0"` yap; uydurma metin yine atılır, sadece bedeli ödenir. O turun token'ları nihai sonuç mesajı yerine akış olaylarından okunduğu için sayaçlar her iki durumda da doğru kalır.
 - **`ENABLE_SESSIONS: "0"` devamlılığı kapatır ama kayıt yazmayı kapatmaz.** Bu ayar yalnızca ağ geçidinin oturum devam ettirmesini engeller; CLI'ya hâlâ bir oturum kimliği verildiği için konuşma yine diske yazılır. Diskte daha az dosya istiyorsan bunun yerine `TRANSCRIPT_RETENTION_HOURS` değerini düşür.
 - Konuşma devamlılığı "elinden geleni yapar" mantığında. Bir mesajı düzenlemek ya da yeniden ürettirmek doğru şekilde yeni oturum açar; bunun bedeli bir kerelik tam geçmiş tekrarıdır.
 - `claude --print --resume` bir gün çalışmaz hale gelirse, ağ geçidi sessizce tam geçmişi tekrar oynatmaya döner. Davranış doğru kalır, sadece yavaşlar. Devrede olduğunu doğrulamak için `/v1/usage` içindeki `session.hits` değerine bak.
@@ -222,6 +230,8 @@ Her şey `docker-compose.yaml` içindeki ortam değişkenleriyle yapılır; dosy
 | `ENABLE_SESSIONS` | `1` | Konuşma devamlılığı |
 | `TRANSCRIPT_RETENTION_HOURS` | `72` | Bu süreden eski oturum kayıtlarını sil; `0` hiç silmez |
 | `ENABLE_TOOL_CALLS` | `1` | Function calling |
+| `TOOL_CALL_EARLY_STOP` | `1` | Tam araç çağrısı okunur okunmaz CLI'ı sonlandır, model sonuçları uyduramasın. `0` bitmesine izin verir; uydurma metin her hâlükârda atılır |
+| `CONTEXT_LENGTH` | `200000` | İstemcilere ilan edilen context penceresi. Yalnızca bir istemci gerçek değerle sorun çıkarırsa düşür |
 | `ENABLE_VISION` | `1` | Görsel girdi ve ilan edilen vision yeteneği |
 | `API_KEYS` | *(boş)* | Virgülle ayrılmış Bearer jetonları. İki porttaki her yolu korur — [Kimlik doğrulama](#kimlik-doğrulama) |
 | `PROTECT_OLLAMA` | `API_KEYS` varsa `1` | `0` yaparsan `/api/...` açık kalır, Ollama istemcileri çalışmaya devam eder |
@@ -239,6 +249,9 @@ Bilmeye değer birkaç karar — her biri zor yoldan öğrenildi:
 - **`--bare` bilerek kullanılmıyor.** Yapılandırma taramasını atlayarak açılışı hızlandırıyor ama Claude Code 2.1.223'te oturum bilgisini okumayı da atlıyor; her istek "Not logged in" ile dönüyor.
 - **`HEAD /` 200 döner.** Ollama CLI herhangi bir şey yapmadan önce `HEAD` ile yokluyor ve 200 almazsa tamamen vazgeçiyor.
 - **`/api/version` istemcinin kendi sürümünü** User-Agent başlığından okuyup geri veriyor, çünkü modern Ollama istemcileri çok eski saydıkları bir sunucuyla konuşmayı reddediyor.
+- **Araç çağrısı cevabın tamamında değil, içinde herhangi bir yerde aranır.** Sözleşme çıplak bir JSON nesnesi istiyor; modeller önce anlatım yazıp sonrasında da devam ediyor. Birebir eşleşme aramak, o cevaplarda hiç araç çağrısı bulunamaması demekti — ham JSON ve modelin aracın ne döndüğüne dair hayal ettiği her şey istemciye düz metin olarak gidiyordu. Artık anlatım içerik olarak korunuyor, çağrı ayrıştırılıyor, sonrasındaki her şey atılıyor.
+- **Thinking, tahminle değil delta tipiyle ayrıştırılıyor.** Claude Code 2.1.224 yüksek efor seviyesinde `thinking_delta` ve `signature_delta` olaylarıyla ayrı bir içerik bloğu üretiyor. Yalnızca `text_delta` cevaba dönüşüyor; thinking kendi alanına gidiyor, imza atılıyor.
+- **Oturum parmak izi, CLI'ın ürettiğinden değil istemcinin geri göndereceğinden kuruluyor.** Araç çağrısı geri `tool_calls` olarak gelir, JSON metni olarak değil; metni parmak izlemek, araç kullanan her turun oturumu ıskalayıp geçmişi yeniden oynatması demekti.
 - **Ağ geçidi kaynağında hiç dolar işareti yok**, çünkü kod bir compose dosyasının içine gömülü ve Docker Compose dolarlı süslü parantez ifadelerini kendi değişkeni sanıp değiştirir.
 - **Prompt'taki XML etiketleri karakter kodundan üretiliyor**, çünkü ZimaOS özel uygulama içe aktarıcısı YAML'daki köşeli parantezli ifadeleri yer tutucu sanıp kurulumu reddediyor.
 
@@ -259,6 +272,8 @@ npm test
 ```
 
 Test paketi, ağ geçidini aynı stream-json protokolünü konuşan sahte bir CLI'ya karşı çalıştırır, dolayısıyla hiç API kotası harcanmaz. Protokol çevirisini, akışı, function calling'i, görsel girdiyi, efor seçimini, oturum devamlılığını, resume başarısızlığındaki yedek yolu, kayıt temizliğini ve compose dosyasına gömülen kaynağın birebirliğini kapsar.
+
+İki paket ayrı duruyor, çünkü bu iş asıl zor durumlarda bozuluyor. `test/tools.test.mjs`, araç çağrısı sözleşmesini gerçek bir modelin bozduğu her biçimde bozan cevapları sürer — önce anlatım, kod bloğu, sonrasında uydurma sonuçlar, ve sadece süslü parantez içeren düz metin — ve her birinde istemcinin aynı temiz sonucu gördüğünü, hem akışlı hem akışsız, `TOOL_CALL_EARLY_STOP` hem açık hem kapalıyken doğrular. `test/thinking.test.mjs`, gerçek CLI'dan gözlenen thinking olay şeklini yeniden üretir ve thinking'in istemciye kendi alanında ulaştığını, cevaptan ve parmak izinden uzak durduğunu sabitler.
 
 Paketin büyük kısmı düz Node ve her yerde çalışır. Compose paketi ayrıca YAML'a gömülü açılış scriptini de çalıştırır; bunun için gerçek bir kabuk gerekir — Windows'ta testleri Git Bash içinden çalıştırın ya da `TEST_BASH` değişkenini bir bash'e yönlendirin. Windows'ta `PATH` üzerindeki `bash` çoğu zaman WSL başlatıcısı olan `C:\Windows\System32\bash.exe`'dir ve kurulu dağıtım yoksa hata verir; paket bunu algılayıp o üç kontrolü başarısız değil, atlandı olarak raporlar. En kritik kontrol — kaynağın YAML blok değeri içinden bayt bayt aynı çıkması — saf JavaScript'tir ve her zaman çalışır.
 

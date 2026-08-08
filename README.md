@@ -129,6 +129,8 @@ Live counters, including how often conversation continuity is working:
 curl -sS http://HOST_IP:3456/v1/usage
 ```
 
+Two numbers there are worth understanding together. `session.hitRate` is how often a turn resumed an existing conversation instead of replaying the whole history, and `tokens.cacheWrite` is how much had to be written to cache rather than read from it. A low hit rate next to a large `cacheWrite` means the history is being re-sent and re-cached every turn — which is the expensive failure mode, and cache writes are billed above the plain input rate. For scale: a one-line request measured against Claude Code 2.1.224 reported two input tokens and 3301 cache-creation tokens, all of it the CLI's own system prompt.
+
 ---
 
 ## Connecting clients
@@ -180,6 +182,8 @@ With `EFFORT_TAGS` set (the default), every effort variant also appears in the c
 
 Not every model supports every level, but an unsupported level does **not** produce an error — it is silently clamped or ignored, so every combination in the list is safe to keep.
 
+**What effort costs.** A higher level buys more thinking, and thinking is billed as output. `opus:max` is the most expensive combination available and it is easy to leave selected in a dropdown and forget about. Watch `/v1/usage` if that matters to you.
+
 ---
 
 ## What works
@@ -188,6 +192,7 @@ Not every model supports every level, but an unsupported level does **not** prod
 - **All Claude models** your subscription can reach, via aliases or exact ids
 - **Reasoning effort** selection, per request or per model entry
 - **Function calling** in both OpenAI and Ollama shapes, including tool results fed back into the conversation
+- **Extended thinking delivered separately**, as `reasoning_content` on the OpenAI side and `message.thinking` on the Ollama side. It never appears inside the answer. Clients that do not understand the field ignore it.
 - **Image input** (png, jpeg, gif, webp) forwarded as real image blocks
 - **Conversation continuity** — the message history is fingerprinted and mapped to a Claude Code session, so only the new message is sent each turn. This engages prompt caching and cuts latency and quota use substantially in long chats.
 - **Built-in tools disabled**, so client text cannot execute commands in the container
@@ -197,12 +202,15 @@ Not every model supports every level, but an unsupported level does **not** prod
 - **Embeddings.** The Claude Code CLI cannot produce vectors. `/api/embeddings` and `/v1/embeddings` return `501` with an explanation rather than silently returning zeros. Use your client's own embedding engine.
 - **Remote image URLs.** Only base64 and `data:` URLs are accepted. Fetching arbitrary URLs from inside the container would open an SSRF surface, so it is deliberately not done; such requests fall back to text and log a warning.
 - **`temperature`, `top_p`, `num_predict` and similar sampling parameters.** The CLI does not accept them, so they are ignored.
-- **Native function calling.** The CLI has no function-calling surface, so tool schemas are injected into the system prompt with a strict output contract and the reply is parsed back. This is reliable in practice but not guaranteed; anything that fails to parse is treated as ordinary text.
+- **Native function calling.** The CLI has no function-calling surface, so tool schemas are injected into the system prompt with a strict output contract and the reply is parsed back. Models routinely break that contract — they narrate before the call, wrap the JSON in a code fence, and keep writing afterwards — so the parser accepts all of those and drops the trailing invention. It is reliable in practice but not guaranteed; anything that still fails to parse is treated as ordinary text.
+- **Stopping the model mid-reply, properly.** There is no stop-sequence, so once a tool call has been written nothing tells the model to be quiet. It carries on and invents the tool results. Those are discarded, and by default the CLI process is killed as soon as a complete call has been read so they are never generated at all — see `TOOL_CALL_EARLY_STOP`.
 - **Multi-user features.** No accounting, quotas, or per-client isolation.
 - **Horizontal scaling.** One container, one CLI process per request.
 
 ## Known rough edges
 
+- **A long message can arrive at the model with its middle missing.** The gateway never truncates anything — but Ollama clients that cannot discover the model's context window assume a small default (2048 or 4096 is common) and trim the conversation themselves to fit, usually by dropping the middle. The context window is now published in every place a client is known to look (`/api/show` `parameters` and `model_info`, `/api/tags` `details`, and `context_window` / `max_model_len` on `/v1/models`), and `CONTEXT_LENGTH` sets the advertised value. Whether a given client reads any of them is not something this side of the wire can guarantee. If long messages still come back half-answered, turn `DEBUG` on and compare the `body: N bytes` line with the size you sent: if the request was already short, the client trimmed it and the fix belongs in the client's settings.
+- **`TOOL_CALL_EARLY_STOP` is new and defaults to on.** Killing the CLI the moment a tool call is complete stops the model inventing tool results, which is where a lot of wasted output came from. It has been tested against a stub that reproduces the behaviour, not against a long-running real conversation. If tool-using chats start losing continuity, set it to `"0"`; the invented text is still discarded, it is just paid for. The tokens that turn is billed are read from the streaming events rather than the final result message, so the counters stay accurate either way.
 - **`ENABLE_SESSIONS: "0"` turns off continuity but not transcript writing.** The setting stops the gateway from resuming sessions; the CLI is still given a session id, so it still records the conversation. If you want fewer files on disk, lower `TRANSCRIPT_RETENTION_HOURS` instead.
 - Conversation continuity is best-effort. Editing or regenerating a message correctly starts a new session, which costs one full history replay.
 - If `claude --print --resume` ever stops working, the gateway silently falls back to replaying the full history. Behaviour stays correct, only slower. Watch `session.hits` in `/v1/usage` to confirm it is engaged.
@@ -222,6 +230,8 @@ Everything is set through environment variables in `docker-compose.yaml`, which 
 | `ENABLE_SESSIONS` | `1` | Conversation continuity |
 | `TRANSCRIPT_RETENTION_HOURS` | `72` | Delete session transcripts older than this; `0` keeps them forever |
 | `ENABLE_TOOL_CALLS` | `1` | Function calling |
+| `TOOL_CALL_EARLY_STOP` | `1` | Kill the CLI as soon as a complete tool call has been read, so the model cannot invent the results. `0` lets it finish; the invented text is discarded either way |
+| `CONTEXT_LENGTH` | `200000` | Context window advertised to clients. Lower it only if a client misbehaves with the real figure |
 | `ENABLE_VISION` | `1` | Image input and the advertised vision capability |
 | `API_KEYS` | *(unset)* | Comma-separated Bearer tokens. Guards every path on both ports — see [Authentication](#authentication) |
 | `PROTECT_OLLAMA` | `1` when `API_KEYS` is set | Set to `0` to leave `/api/...` open so Ollama clients still work |
@@ -239,6 +249,9 @@ A few decisions worth knowing about, each learned the hard way:
 - **`--bare` is deliberately not used.** It speeds up startup by skipping config discovery, but on Claude Code 2.1.223 it also skips reading stored credentials, so every request fails with "Not logged in".
 - **`HEAD /` returns 200.** The Ollama CLI probes with `HEAD` before doing anything, and gives up entirely if that is not a 200.
 - **`/api/version` echoes the client's own version** from its User-Agent header, because modern Ollama clients refuse to talk to a server they consider too old.
+- **A tool call is looked for anywhere in the reply, not only as the whole of it.** The contract asks for a bare JSON object; models narrate first and keep writing afterwards. Requiring an exact match meant those replies produced no tool call at all, and the raw JSON plus whatever the model imagined the tool returned went to the client as prose. The narration is kept as content, the call is parsed, and everything after it is dropped.
+- **Thinking is routed on the delta type, not guessed at.** Claude Code 2.1.224 at a high effort level emits a separate content block with `thinking_delta` and `signature_delta` events. Only `text_delta` becomes the answer; thinking goes to its own field and the signature is discarded.
+- **The session fingerprint is built from what the client will send back**, not from what the CLI produced. A tool call comes back as `tool_calls`, never as the JSON text, so fingerprinting the text meant every tool-using turn missed its session and replayed history.
 - **The gateway source contains no dollar signs**, because it is embedded in a compose file and Docker Compose would substitute dollar-brace expressions as its own variables.
 - **XML tags in prompts are built from character codes**, because the ZimaOS custom-app importer treats angle-bracketed tokens in the YAML as placeholders and refuses to install.
 
@@ -259,6 +272,8 @@ npm test
 ```
 
 The test suite runs the gateway against a stub CLI that speaks the same stream-json protocol, so no API quota is consumed. It covers protocol translation, streaming, tool calling, image input, effort selection, session continuity, the resume-failure fallback, transcript pruning, and the fidelity of the source embedded in the compose file.
+
+Two suites exist because the awkward cases are where this breaks. `test/tools.test.mjs` drives replies that break the tool-call contract in every way a real model does — narration first, a code fence, invented results afterwards, and prose that merely contains a brace — and checks that the client sees the same clean result in each, streamed and not, with `TOOL_CALL_EARLY_STOP` both on and off. `test/thinking.test.mjs` reproduces the thinking event shape observed from the real CLI and pins down that it reaches the client in its own field and stays out of the answer and the fingerprint.
 
 Most of it is plain Node and runs anywhere. The compose suite additionally executes the bootstrap script embedded in the YAML, which needs a real shell — on Windows run the tests from Git Bash, or point `TEST_BASH` at a bash binary. Note that on Windows the `bash` on `PATH` is often `C:\Windows\System32\bash.exe`, the WSL launcher, which fails when no distribution is installed; the suite detects this and reports those three checks as skipped instead of failed. The check that matters most — that the source survives the YAML block scalar byte for byte — is pure JavaScript and always runs.
 
