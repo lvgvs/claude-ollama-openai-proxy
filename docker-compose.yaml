@@ -306,6 +306,15 @@ services:
           useSessions: process.env.ENABLE_SESSIONS !== "0",
           useToolCalls: process.env.ENABLE_TOOL_CALLS !== "0",
 
+          // The CLI has no stop-sequence, so nothing tells the model to be quiet once it
+          // has emitted a tool call. Left alone it carries on and invents the tool
+          // results itself - output tokens that are billed, thrown away here, and would
+          // otherwise be fed back as history on the next turn. When this is on the CLI
+          // process is killed the moment a complete tool call has been read.
+          // Set TOOL_CALL_EARLY_STOP to "0" to let the process finish instead; the
+          // invented text is still discarded, it is just paid for.
+          toolCallEarlyStop: process.env.TOOL_CALL_EARLY_STOP !== "0",
+
           // Image support does two things: advertises the "vision" capability so
           // clients send images as message content, and forwards those images to the
           // CLI as real image blocks. No tool is enabled for this.
@@ -324,6 +333,14 @@ services:
 
           maxBodyBytes: envInt("MAX_BODY_MB", 32) * 1024 * 1024,
           lookbackDepth: envInt("SESSION_LOOKBACK", 6),
+
+          // Advertised context window. The gateway itself never truncates anything, but
+          // Ollama clients that cannot discover a context length assume a small default
+          // (2048 or 4096 is common) and silently drop the middle of a long
+          // conversation to fit it. Publishing the real number in every place a client
+          // might look is the only lever this side of the wire has.
+          contextLength: envInt("CONTEXT_LENGTH", 200000),
+
           debug: process.env.DEBUG === "1",
         };
 
@@ -519,9 +536,23 @@ services:
           return out;
         }
 
-        // Runs one claude invocation. Partial text is delivered through onDelta.
-        // Resolves to { text, sessionId, usage, isError, errorText, exitCode }.
-        function runClaude(opts, onDelta) {
+        /*
+         * Runs one claude invocation.
+         *
+         * Answer text arrives through onDelta, extended thinking through onThinking.
+         * The two are kept apart all the way to the client: thinking is a separate
+         * content block in the CLI stream (delta type "thinking_delta", observed on
+         * Claude Code 2.1.224 with a high effort level) and must never be mixed into
+         * the answer.
+         *
+         * With opts.watchToolCalls set, the reply is scanned as it streams and the CLI
+         * is stopped as soon as a complete tool call has been read - see the note on
+         * CFG.toolCallEarlyStop.
+         *
+         * Resolves to { text, thinking, sessionId, usage, isError, errorText,
+         * exitCode, earlyStopped }.
+         */
+        function runClaude(opts, onDelta, onThinking) {
           return new Promise((resolve, reject) => {
             const args = CFG.claudeBinArgs.concat(buildArgs(opts));
             dbg("spawn", CFG.claudeBin, JSON.stringify(redactArgs(args)));
@@ -539,13 +570,37 @@ services:
 
             let buffer = "";
             let collected = "";
+            let thinking = "";
             let sessionId = opts.resume || opts.sessionId || null;
             let usage = null;
+            // Usage as reported by the streaming events rather than the final result
+            // message. Killing the process early means no result message arrives, so
+            // without this the token counters would go blind on every tool call. Used
+            // only as a fallback: if a future release changes the event shape the
+            // counters simply stay where they are today.
+            let streamUsage = null;
             let finalText = null;
             let isError = false;
             let errorText = "";
             let stderrTail = "";
             let settled = false;
+            let earlyStopped = false;
+
+            const watcher = opts.watchToolCalls ? makeToolCallWatcher() : null;
+
+            // The CLI stops here rather than after inventing the tool results. There is
+            // no "result" message once the process is killed, so usage is unavailable
+            // for this turn and the collected text becomes the reply.
+            const stopEarly = () => {
+              if (earlyStopped || settled) return;
+              earlyStopped = true;
+              dbg("tool call complete, stopping the CLI early");
+              try {
+                child.kill("SIGTERM");
+              } catch (e) {
+                /* already gone */
+              }
+            };
 
             const timer = setTimeout(() => {
               if (settled) return;
@@ -573,12 +628,27 @@ services:
 
               if (msg.type === "stream_event" && msg.event) {
                 const ev = msg.event;
-                if (ev.type === "content_block_delta" && ev.delta && ev.delta.type === "text_delta") {
-                  const text = ev.delta.text || "";
-                  if (text) {
-                    collected += text;
-                    if (onDelta) onDelta(text);
+                if (ev.type === "content_block_delta" && ev.delta) {
+                  if (ev.delta.type === "text_delta") {
+                    const text = ev.delta.text || "";
+                    if (text) {
+                      collected += text;
+                      if (onDelta) onDelta(text);
+                      if (watcher && watcher.push(text)) stopEarly();
+                    }
+                  } else if (ev.delta.type === "thinking_delta") {
+                    const thought = ev.delta.thinking || "";
+                    if (thought) {
+                      thinking += thought;
+                      if (onThinking) onThinking(thought);
+                    }
                   }
+                  // signature_delta, and anything else a future release adds, is
+                  // ignored on purpose rather than falling through into the answer.
+                } else if (ev.type === "message_start" && ev.message && ev.message.usage) {
+                  streamUsage = Object.assign({}, ev.message.usage);
+                } else if (ev.type === "message_delta" && ev.usage) {
+                  streamUsage = Object.assign({}, streamUsage || {}, ev.usage);
                 }
                 return;
               }
@@ -623,13 +693,15 @@ services:
               settled = true;
               clearTimeout(timer);
               if (buffer.trim()) handleLine(buffer);
+              if (!usage) usage = streamUsage;
 
               if (isError) {
-                return resolve({ text: "", sessionId, usage, isError: true, errorText, exitCode: code });
+                return resolve({ text: "", thinking, sessionId, usage, isError: true, errorText, exitCode: code, earlyStopped });
               }
               if (finalText === null && !collected) {
                 return resolve({
                   text: "",
+                  thinking,
                   sessionId,
                   usage,
                   isError: true,
@@ -637,16 +709,21 @@ services:
                     "Claude CLI exited with code " + code + " without producing a response. " +
                     (stderrTail.trim() ? "stderr: " + stderrTail.trim().slice(-400) : ""),
                   exitCode: code,
+                  earlyStopped,
                 });
               }
               resolve({
-                // Prefer the final result field; fall back to the streamed deltas.
+                // Prefer the final result field; fall back to the streamed deltas. An
+                // early stop never produces a result message, so it always lands on the
+                // collected text - which is exactly the part worth keeping.
                 text: finalText !== null ? finalText : collected,
+                thinking,
                 sessionId,
                 usage,
                 isError: false,
                 errorText: "",
                 exitCode: code,
+                earlyStopped,
               });
             });
 
@@ -1035,18 +1112,33 @@ services:
             return null;
           }
 
-          // After a turn completes, bind the prefix the client will send next time to
-          // this session.
-          remember(messages, replyText, sid, model, sysHash) {
+          /*
+           * After a turn completes, bind the prefix the client will send next time to
+           * this session.
+           *
+           * "reply" is the assistant turn in the shape the CLIENT will echo back, not
+           * the raw CLI output, and that distinction is the whole point. When the reply
+           * is a tool call the client sends it back as { content: null, tool_calls:
+           * [...] }; a fingerprint built from the raw JSON text therefore never matched,
+           * so every tool-using turn missed the session and replayed the full history.
+           * Clients also disagree about what they keep, so both plausible shapes are
+           * registered against the same session.
+           */
+          remember(messages, reply, sid, model, sysHash) {
             for (const k of this.keysBySid.get(sid) || []) this.byKey.delete(k);
 
-            const withReply = messages.concat([
-              { role: "assistant", text: replyText, toolCalls: null, mediaKey: "" },
-            ]);
-            const keys = [
-              this.fingerprint(withReply, withReply.length, model, sysHash),
-              this.fingerprint(messages, messages.length, model, sysHash),
-            ];
+            const text = reply.text || "";
+            const shapes = [{ role: "assistant", text, toolCalls: reply.toolCalls || null, mediaKey: "" }];
+            // A client that renders the call but does not send tool_calls back still
+            // lands on this session through the second shape.
+            if (reply.toolCalls) shapes.push({ role: "assistant", text, toolCalls: null, mediaKey: "" });
+
+            const keys = [this.fingerprint(messages, messages.length, model, sysHash)];
+            for (const shape of shapes) {
+              const withReply = messages.concat([shape]);
+              keys.push(this.fingerprint(withReply, withReply.length, model, sysHash));
+            }
+
             const ts = Date.now();
             for (const key of keys) this.byKey.set(key, { sid, ts });
             this.keysBySid.set(sid, keys);
@@ -1123,10 +1215,13 @@ services:
             "1. To call one or more tools, reply with ONLY this JSON object. No prose",
             "   before or after it, and no markdown code fence:",
             '   {"tool_calls":[{"name":"TOOL_NAME","arguments":{}}]}',
-            "2. If no tool is needed, answer normally in plain text and never emit that",
+            "2. Emit that object and then STOP. Never write what you think the tool",
+            "   returned. The call is executed elsewhere and the real result is handed",
+            "   back to you on the next turn; anything you invent here is discarded.",
+            "3. If no tool is needed, answer normally in plain text and never emit that",
             "   JSON shape.",
-            "3. Use only the tool names listed below. Never invent a tool.",
-            "4. " + openTag('tool_result name="..."') + " blocks contain the results of tool",
+            "4. Use only the tool names listed below. Never invent a tool.",
+            "5. " + openTag('tool_result name="..."') + " blocks contain the results of tool",
             "   calls you requested earlier. Continue from them.",
             "",
             "Tools (JSON Schema):",
@@ -1135,24 +1230,43 @@ services:
         }
 
         const FENCE = "```";
+        const TOOL_MARKER = '"tool_calls"';
 
-        function stripFence(text) {
-          let t = text.trim();
-          if (!t.startsWith(FENCE)) return t;
-          const firstNewline = t.indexOf("\n");
-          if (firstNewline === -1) return t;
-          t = t.slice(firstNewline + 1);
-          const closing = t.lastIndexOf(FENCE);
-          if (closing !== -1) t = t.slice(0, closing);
-          return t.trim();
+        /*
+         * Finds the first balanced JSON object at or after "from". String- and
+         * escape-aware, so braces inside string values do not confuse the depth count.
+         * Returns { start, end } with end exclusive, or null while the object is still
+         * incomplete - which is what lets the streaming watcher below know when the
+         * whole tool call has arrived.
+         */
+        function findJsonObject(text, from) {
+          const start = text.indexOf("{", from || 0);
+          if (start === -1) return null;
+          let depth = 0;
+          let inString = false;
+          let escaped = false;
+          for (let i = start; i < text.length; i++) {
+            const c = text[i];
+            if (inString) {
+              if (escaped) escaped = false;
+              else if (c === "\\") escaped = true;
+              else if (c === '"') inString = false;
+              continue;
+            }
+            if (c === '"') inString = true;
+            else if (c === "{") depth++;
+            else if (c === "}") {
+              depth--;
+              if (depth === 0) return { start, end: i + 1 };
+            }
+          }
+          return null;
         }
 
-        function parseToolCalls(text) {
-          const t = stripFence(text || "");
-          if (!t.startsWith("{")) return null;
+        function callsFromJson(slice) {
           let obj;
           try {
-            obj = JSON.parse(t);
+            obj = JSON.parse(slice);
           } catch (e) {
             return null;
           }
@@ -1161,29 +1275,161 @@ services:
           return calls.length ? calls : null;
         }
 
-        // While streaming: if the first non-whitespace character is a brace or a code
-        // fence the reply may be a tool call, so buffer it. Otherwise stream straight
-        // through. This keeps normal replies responsive while tools are enabled.
-        function makeStreamGate(toolsActive) {
-          let decided = !toolsActive;
-          let buffered = "";
+        // A fence opener immediately before the JSON belongs to the tool call, not to
+        // the prose that preceded it. Written without a regex end anchor on purpose:
+        // this file may contain no dollar signs (see the note at the top).
+        function trimTrailingFence(text) {
+          const t = String(text).trimEnd();
+          const at = t.lastIndexOf(FENCE);
+          if (at === -1) return t;
+          // Strip it only when nothing but a language tag follows the backticks -
+          // otherwise this is the closing fence of a code block in the prose itself.
+          if (/[^A-Za-z0-9_-]/.test(t.slice(at + FENCE.length))) return t;
+          return t.slice(0, at).trimEnd();
+        }
+
+        /*
+         * Pulls a tool call out of a reply.
+         *
+         * The instructions ask the model to answer with nothing but the JSON object,
+         * and it frequently does not: it narrates first ("Let me look that up"), wraps
+         * the JSON in a code fence, and - because the CLI has no stop-sequence - keeps
+         * going afterwards and writes what it imagines the tool returned. An earlier
+         * version required the whole reply to be exactly one JSON object, so any of
+         * those produced no tool call at all and the raw JSON plus the invented results
+         * were handed to the client as ordinary prose.
+         *
+         * Returns { calls, before } where "before" is the prose leading up to the call
+         * (kept - OpenAI allows content alongside tool_calls), or null if there is no
+         * tool call. Everything after the object is dropped: it is invented.
+         */
+        function extractToolCalls(text) {
+          const raw = String(text || "");
+          let from = 0;
+          for (;;) {
+            const found = findJsonObject(raw, from);
+            if (!found) return null;
+            const slice = raw.slice(found.start, found.end);
+            if (slice.includes(TOOL_MARKER)) {
+              const calls = callsFromJson(slice);
+              if (calls) return { calls, before: trimTrailingFence(raw.slice(0, found.start)) };
+            }
+            from = found.start + 1;
+          }
+        }
+
+        /*
+         * Watches a reply as it streams and reports the moment a complete, valid tool
+         * call has been read, so the CLI process can be stopped there.
+         *
+         * Scanning is incremental: the marker search only covers the newly arrived text
+         * (plus an overlap the length of the marker), and the balance check only runs
+         * once the marker has been seen. A reply that never contains a tool call costs
+         * one indexOf per delta.
+         */
+        function makeToolCallWatcher() {
+          let text = "";
+          let searched = 0;
+          let objectStart = -1;
+
           return {
             push(chunk) {
-              if (decided) return { emit: buffered ? buffered + chunk : chunk };
-              buffered += chunk;
-              const trimmed = buffered.trimStart();
-              if (!trimmed) return { emit: null };
-              if (trimmed.startsWith("{") || trimmed.startsWith(FENCE)) return { emit: null };
-              decided = true;
-              const out = buffered;
-              buffered = "";
-              return { emit: out };
+              text += chunk;
+              if (objectStart === -1) {
+                const at = text.indexOf(TOOL_MARKER, Math.max(0, searched - TOOL_MARKER.length));
+                searched = text.length;
+                if (at === -1) return false;
+                objectStart = text.lastIndexOf("{", at);
+                if (objectStart === -1) return false;
+              }
+              const found = findJsonObject(text, objectStart);
+              if (!found) return false; // still arriving
+              const slice = text.slice(found.start, found.end);
+              if (slice.includes(TOOL_MARKER) && callsFromJson(slice)) return true;
+              // A balanced object that is not a tool call - keep looking after it.
+              objectStart = -1;
+              searched = found.end;
+              return false;
             },
+          };
+        }
+
+        // Index of the first character that could open a tool call, or -1.
+        function markerIndex(s) {
+          const brace = s.indexOf("{");
+          const fence = s.indexOf(FENCE);
+          if (brace === -1) return fence;
+          if (fence === -1) return brace;
+          return Math.min(brace, fence);
+        }
+
+        function isSpaceChar(c) {
+          return c === " " || c === "\t" || c === "\n" || c === "\r";
+        }
+
+        /*
+         * Length of the trailing run that might turn out to belong to a tool call
+         * rather than to the prose: the whitespace that separates the two, and a fence
+         * that is still arriving one backtick at a time.
+         *
+         * Holding it back for a single chunk is what makes the streamed text identical
+         * to the non-streamed reply. Without it a call introduced by "Checking now.\n"
+         * streams that newline and the non-streaming path trims it, so the same reply
+         * reaches the client as two different strings.
+         */
+        function heldTail(s) {
+          let n = 0;
+          while (n < s.length) {
+            const c = s[s.length - 1 - n];
+            if (c === "`" || isSpaceChar(c)) n++;
+            else break;
+          }
+          return n;
+        }
+
+        /*
+         * Decides, while streaming, what may reach the client.
+         *
+         * With tools active everything up to the first brace or fence is streamed
+         * normally, and everything from there on is withheld. If the withheld text
+         * turns out to be a tool call it is dropped; if it turns out to be ordinary
+         * prose the caller sends it as the tail. The previous version made this
+         * decision once, on the first chunk only, so a reply that opened with a
+         * sentence streamed the tool-call JSON straight through afterwards.
+         */
+        function makeStreamGate(toolsActive) {
+          let carry = "";
+          let held = "";
+          let holding = false;
+
+          return {
+            push(chunk) {
+              if (!toolsActive) return { emit: chunk };
+              if (holding) {
+                held += chunk;
+                return { emit: null };
+              }
+              const buf = carry + chunk;
+              carry = "";
+              const i = markerIndex(buf);
+              if (i !== -1) {
+                holding = true;
+                // The whitespace separating the prose from the call goes with the call.
+                let cut = i;
+                while (cut > 0 && isSpaceChar(buf[cut - 1])) cut--;
+                held = buf.slice(cut);
+                return { emit: buf.slice(0, cut) || null };
+              }
+              const keep = heldTail(buf);
+              if (keep) {
+                carry = buf.slice(buf.length - keep);
+                return { emit: buf.slice(0, buf.length - keep) || null };
+              }
+              return { emit: buf || null };
+            },
+            // Everything withheld so far. Exactly one of carry and held is ever set.
             get pending() {
-              return buffered;
-            },
-            get isBuffering() {
-              return !decided;
+              return carry + held;
             },
           };
         }
@@ -1200,13 +1446,36 @@ services:
           inputTokens: 0,
           outputTokens: 0,
           cacheReadTokens: 0,
+          cacheWriteTokens: 0,
         };
 
+        /*
+         * Cache writes are counted too, and they matter more than they look.
+         *
+         * A measurement against Claude Code 2.1.224 showed a trivial one-line request
+         * reporting input_tokens 2 and cache_creation_input_tokens 3301: the CLI's own
+         * system prompt, written to cache on every fresh session. Ignoring that field
+         * made /v1/usage report a fraction of what was actually being spent, and cache
+         * writes are billed above the plain input rate - so a low session hit rate is
+         * far more expensive than the old counters suggested.
+         */
         function recordUsage(usage) {
           if (!usage) return;
           stats.inputTokens += usage.input_tokens || 0;
           stats.outputTokens += usage.output_tokens || 0;
           stats.cacheReadTokens += usage.cache_read_input_tokens || 0;
+          stats.cacheWriteTokens += usage.cache_creation_input_tokens || 0;
+        }
+
+        // Everything the model had to read for this turn, however it was billed.
+        // Reporting only input_tokens told clients a two-token prompt had been sent.
+        function promptTokens(usage) {
+          if (!usage) return 0;
+          return (
+            (usage.input_tokens || 0) +
+            (usage.cache_read_input_tokens || 0) +
+            (usage.cache_creation_input_tokens || 0)
+          );
         }
 
         // ------------------------------------------------------------- core pipeline
@@ -1215,11 +1484,12 @@ services:
 
         /*
          * Handles a single chat turn.
-         *   body    : request body from the client (OpenAI or Ollama shape)
-         *   onDelta : receives streamed text chunks, or null for non-streaming
-         * Returns { text, pending, toolCalls, usage, model, sessionId }.
+         *   body       : request body from the client (OpenAI or Ollama shape)
+         *   onDelta    : receives streamed answer chunks, or null for non-streaming
+         *   onThinking : receives streamed thinking chunks, or null
+         * Returns { text, thinking, pending, toolCalls, usage, model, sessionId }.
          */
-        async function chatTurn(body, onDelta) {
+        async function chatTurn(body, onDelta, onThinking) {
           const target = resolveModel(body.model);
           const model = target.model;
           const effort = effortFor(body, target.effort);
@@ -1264,6 +1534,28 @@ services:
           if (match) stats.sessionHits++;
           else stats.sessionMisses++;
 
+          /*
+           * One line per turn, enough to answer the questions that otherwise turn into
+           * guesswork: did the whole message arrive, did the session match, and how far
+           * back did the history have to be replayed.
+           *
+           * Sizes only - no message text is ever logged. num_ctx is echoed because
+           * clients send it to say what they believe the context window is, and a small
+           * value there is the tell that the client trimmed the history itself.
+           */
+          if (CFG.debug) {
+            const numCtx = (body.options && body.options.num_ctx) || 0;
+            dbg(
+              "turn: model=" + model +
+                " effort=" + (effort || "-") +
+                " tools=" + schemas.length +
+                " messages=" + messages.length +
+                " chars=[" + messages.map((m) => m.role.charAt(0) + ":" + m.text.length).join(",") + "]" +
+                " session=" + (match ? "hit from=" + match.newFrom : "miss") +
+                (numCtx ? " client-num_ctx=" + numCtx + " (ignored here, advertised " + CFG.contextLength + ")" : "")
+            );
+          }
+
           const sid = match ? match.sid : randomUUID();
           const newFrom = match ? match.newFrom : 0;
 
@@ -1278,6 +1570,12 @@ services:
 
             const invoke = (from, resume, sessionId) => {
               const prompt = buildPrompt(messages, from);
+              dbg(
+                "prompt: from=" + from +
+                  " bytes=" + Buffer.byteLength(promptOrMediaNote(prompt, droppedMedia) || "") +
+                  " system=" + Buffer.byteLength(systemPrompt || "") +
+                  (resume ? " resume" : " fresh")
+              );
               return runClaude(
                 {
                   model,
@@ -1287,9 +1585,22 @@ services:
                   systemPrompt,
                   resume,
                   sessionId,
+                  watchToolCalls: schemas.length > 0 && CFG.toolCallEarlyStop,
                 },
-                forward
+                forward,
+                onThinking
               );
+            };
+
+            // The assistant turn as the CLIENT will store it: the prose without the
+            // tool call, plus the parsed calls. Everything the model wrote after the
+            // call is invented and is dropped here, before it can be sent, remembered,
+            // or replayed as history on the next turn.
+            const canonical = (r) => {
+              const extracted = schemas.length ? extractToolCalls(r.text) : null;
+              return extracted
+                ? { text: extracted.before, toolCalls: extracted.calls }
+                : { text: r.text, toolCalls: null };
             };
 
             let result = match ? await invoke(newFrom, sid, null) : await invoke(0, null, sid);
@@ -1304,19 +1615,21 @@ services:
               stats.sessionMisses++;
               const fresh = randomUUID();
               result = await invoke(0, null, fresh);
+              const reply = canonical(result);
               if (!result.isError && CFG.useSessions) {
-                sessions.remember(messages, result.text, result.sessionId || fresh, model, sysHash);
+                sessions.remember(messages, reply, result.sessionId || fresh, model, sysHash);
               }
-              return { result, gate };
+              return { result, gate, reply };
             }
 
+            const reply = canonical(result);
             if (!result.isError && CFG.useSessions) {
-              sessions.remember(messages, result.text, result.sessionId || sid, model, sysHash);
+              sessions.remember(messages, reply, result.sessionId || sid, model, sysHash);
             }
-            return { result, gate };
+            return { result, gate, reply };
           };
 
-          const { result, gate } = CFG.useSessions ? await sessions.withLock(sid, run) : await run();
+          const { result, gate, reply } = CFG.useSessions ? await sessions.withLock(sid, run) : await run();
 
           if (result.isError) {
             stats.failures++;
@@ -1325,16 +1638,29 @@ services:
 
           recordUsage(result.usage);
           stats.requests++;
+          if (reply.toolCalls) stats.toolCalls++;
 
-          const calls = schemas.length ? parseToolCalls(result.text) : null;
-          if (calls) stats.toolCalls++;
+          if (CFG.debug) {
+            const u = result.usage || {};
+            dbg(
+              "tokens: prompt=" + promptTokens(result.usage) +
+                " (fresh=" + (u.input_tokens || 0) +
+                " cacheRead=" + (u.cache_read_input_tokens || 0) +
+                " cacheWrite=" + (u.cache_creation_input_tokens || 0) + ")" +
+                " output=" + (u.output_tokens || 0) +
+                (result.thinking ? " thinkingChars=" + result.thinking.length : "") +
+                (result.earlyStopped ? " (stopped early at the tool call)" : "")
+            );
+          }
 
           return {
-            text: result.text,
-            // Text held in the gate that turned out not to be a tool call, and so has
-            // not been streamed yet.
-            pending: gate.isBuffering ? gate.pending : "",
-            toolCalls: calls,
+            text: reply.text,
+            thinking: result.thinking || "",
+            // Text the gate held back that turned out not to be a tool call, and so has
+            // not been streamed yet. When it WAS a tool call the held text is the call
+            // itself and must never be sent.
+            pending: reply.toolCalls ? "" : gate.pending,
+            toolCalls: reply.toolCalls,
             usage: result.usage,
             model,
             sessionId: result.sessionId,
@@ -1358,6 +1684,10 @@ services:
             });
             req.on("end", () => {
               const raw = Buffer.concat(chunks).toString("utf8");
+              // How much actually arrived. This gateway never truncates a request, so
+              // when a long message comes out short at the model, this number says
+              // whether it was already short when the client sent it.
+              dbg("body: " + size + " bytes");
               if (!raw) return resolve({});
               try {
                 resolve(JSON.parse(raw));
@@ -1411,9 +1741,14 @@ services:
         }
 
         function usageBlock(usage) {
-          const i = (usage && usage.input_tokens) || 0;
+          const i = promptTokens(usage);
           const o = (usage && usage.output_tokens) || 0;
-          return { prompt_tokens: i, completion_tokens: o, total_tokens: i + o };
+          return {
+            prompt_tokens: i,
+            completion_tokens: o,
+            total_tokens: i + o,
+            prompt_tokens_details: { cached_tokens: (usage && usage.cache_read_input_tokens) || 0 },
+          };
         }
 
         async function handleOpenAiChat(req, res, body) {
@@ -1422,10 +1757,13 @@ services:
           const shownModel = body.model || CFG.defaultModel;
 
           if (!stream) {
-            const out = await chatTurn(body, null);
+            const out = await chatTurn(body, null, null);
             const message = out.toolCalls
-              ? { role: "assistant", content: null, tool_calls: openaiToolCalls(out.toolCalls) }
+              ? { role: "assistant", content: out.text || null, tool_calls: openaiToolCalls(out.toolCalls) }
               : { role: "assistant", content: out.text };
+            // Thinking travels in its own field, never inside content. Clients that do
+            // not know it ignore it; clients that do render it separately.
+            if (out.thinking) message.reasoning_content = out.thinking;
             return sendJson(res, 200, {
               id: requestId,
               object: "chat.completion",
@@ -1445,7 +1783,11 @@ services:
           res.flushHeaders();
           res.write(":ok\n\n");
 
+          // "first" covers any delta, so the role is announced once even when thinking
+          // arrives before the answer. "sentText" tracks answer text specifically,
+          // which is what decides whether a tail still has to be sent.
           let first = true;
+          let sentText = false;
           const send = (obj) => {
             if (!res.writableEnded) res.write("data: " + JSON.stringify(obj) + "\n\n");
           };
@@ -1456,23 +1798,34 @@ services:
             model: shownModel,
             choices: [{ index: 0, delta, finish_reason: finish || null }],
           });
+          const withRole = (delta) => {
+            if (!first) return delta;
+            first = false;
+            return Object.assign({ role: "assistant" }, delta);
+          };
 
           try {
-            const out = await chatTurn(body, (text) => {
-              send(chunk(first ? { role: "assistant", content: text } : { content: text }));
-              first = false;
-            });
+            const out = await chatTurn(
+              body,
+              (text) => {
+                send(chunk(withRole({ content: text })));
+                sentText = true;
+              },
+              (thought) => {
+                send(chunk(withRole({ reasoning_content: thought })));
+              }
+            );
 
             if (out.toolCalls) {
-              send(chunk({ role: "assistant", content: null, tool_calls: openaiToolCalls(out.toolCalls) }));
+              send(chunk(withRole({ tool_calls: openaiToolCalls(out.toolCalls) })));
               send(chunk({}, "tool_calls"));
             } else {
-              // Either text buffered by the tool gate that turned out to be prose, or
-              // the full reply if the CLI produced no partial messages at all.
-              const tail = out.pending || (first ? out.text : "");
+              // Either text the tool gate held back that turned out to be prose, or the
+              // full reply if the CLI produced no partial messages at all.
+              const tail = out.pending || (sentText ? "" : out.text);
               if (tail) {
-                send(chunk(first ? { role: "assistant", content: tail } : { content: tail }));
-                first = false;
+                send(chunk(withRole({ content: tail })));
+                sentText = true;
               }
               send(chunk({}, "stop"));
             }
@@ -1521,7 +1874,11 @@ services:
               families: CFG.enableVision ? ["claude", "clip"] : ["claude"],
               parameter_size: "cloud",
               quantization_level: "none",
+              context_length: CFG.contextLength,
             },
+            // Not part of the Ollama schema, but harmless to clients that ignore it and
+            // enough for the ones that look here before assuming 4096.
+            context_length: CFG.contextLength,
           };
         }
 
@@ -1559,14 +1916,25 @@ services:
             return base;
           };
 
+          // Thinking rides in its own field, exactly as Ollama carries it, so it can
+          // never be mistaken for the answer.
+          const wrapThinking = (thought) => {
+            const base = { model: shownModel, created_at: new Date().toISOString(), done: false };
+            if (isGenerate) base.thinking = thought;
+            else base.message = { role: "assistant", content: "", thinking: thought };
+            return base;
+          };
+
           const toolCallsOf = (out) =>
             out.toolCalls.map((c) => ({ function: { name: c.name, arguments: c.arguments } }));
 
           if (!stream) {
-            const out = await chatTurn(payload, null);
+            const out = await chatTurn(payload, null, null);
             const extra = out.toolCalls ? { tool_calls: toolCallsOf(out) } : {};
-            const done = wrap(out.toolCalls ? "" : out.text, true, extra);
-            done.prompt_eval_count = (out.usage && out.usage.input_tokens) || 0;
+            if (out.thinking) extra.thinking = out.thinking;
+            const done = wrap(out.text, true, extra);
+            if (isGenerate && out.thinking) done.thinking = out.thinking;
+            done.prompt_eval_count = promptTokens(out.usage);
             done.eval_count = (out.usage && out.usage.output_tokens) || 0;
             return sendJson(res, 200, done);
           }
@@ -1577,22 +1945,26 @@ services:
             "X-Accel-Buffering": "no",
           });
 
-          let sentAny = false;
+          let sentText = false;
           try {
-            const out = await chatTurn(payload, (text) => {
-              sentAny = true;
-              ndjson(res, wrap(text, false));
-            });
+            const out = await chatTurn(
+              payload,
+              (text) => {
+                sentText = true;
+                ndjson(res, wrap(text, false));
+              },
+              (thought) => ndjson(res, wrapThinking(thought))
+            );
 
             if (out.toolCalls) {
               ndjson(res, wrap("", false, { tool_calls: toolCallsOf(out) }));
             } else {
-              const tail = out.pending || (sentAny ? "" : out.text);
+              const tail = out.pending || (sentText ? "" : out.text);
               if (tail) ndjson(res, wrap(tail, false));
             }
 
             const final = wrap("", true);
-            final.prompt_eval_count = (out.usage && out.usage.input_tokens) || 0;
+            final.prompt_eval_count = promptTokens(out.usage);
             final.eval_count = (out.usage && out.usage.output_tokens) || 0;
             ndjson(res, final);
           } catch (err) {
@@ -1693,6 +2065,11 @@ services:
                 object: "model",
                 owned_by: "anthropic",
                 created: nowSec(),
+                // Same reason as /api/show: different clients look for different keys,
+                // and one that finds none assumes a small window and trims history.
+                context_window: CFG.contextLength,
+                max_model_len: CFG.contextLength,
+                max_tokens: CFG.contextLength,
               })),
             });
           }
@@ -1744,13 +2121,18 @@ services:
             return sendJson(res, 200, {
               license: "Anthropic Commercial Terms of Service",
               modelfile: "FROM " + name,
-              parameters: "",
+              // Clients read the context window from wildly different places. All of
+              // them are filled in, because a client that fails to find it falls back
+              // to a small default and quietly drops the middle of long conversations.
+              parameters: "num_ctx " + CFG.contextLength,
               template: "{{ .Prompt }}",
               details: ollamaModelEntry(name).details,
+              context_length: CFG.contextLength,
               model_info: {
                 "general.architecture": "claude",
                 "general.parameter_count": 0,
-                "claude.context_length": 200000,
+                "general.context_length": CFG.contextLength,
+                "claude.context_length": CFG.contextLength,
               },
               capabilities: ["completion"]
                 .concat(CFG.useToolCalls ? ["tools"] : [])
@@ -1831,6 +2213,9 @@ services:
               input: stats.inputTokens,
               output: stats.outputTokens,
               cacheRead: stats.cacheReadTokens,
+              // Written to cache rather than read from it. A high number here next to a
+              // low hit rate means the history is being re-cached every turn.
+              cacheWrite: stats.cacheWriteTokens,
             },
             uptimeSec: Math.floor((Date.now() - stats.startedAt) / 1000),
           };

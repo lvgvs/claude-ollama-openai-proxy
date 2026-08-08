@@ -56,6 +56,17 @@ async function main() {
   check("api/show advertises tools", show.json.capabilities.includes("tools"), show.text);
   check("api/show advertises vision", show.json.capabilities.includes("vision"), show.text);
 
+  // A client that cannot find a context window assumes a small default and
+  // silently drops the middle of a long conversation, so every place one might
+  // look has to carry the real number.
+  check("api/show publishes num_ctx", show.json.parameters === "num_ctx 200000", show.json.parameters);
+  check("api/show publishes the context length under both keys",
+    show.json.model_info["claude.context_length"] === 200000 &&
+      show.json.model_info["general.context_length"] === 200000,
+    JSON.stringify(show.json.model_info));
+  check("api/tags publishes the context length", tags.models[0].details.context_length === 200000, JSON.stringify(tags.models[0].details));
+  check("v1/models publishes the context window", models.data[0].context_window === 200000 && models.data[0].max_model_len === 200000, JSON.stringify(models.data[0]));
+
   section("Cross-protocol serving");
   // Clients disagree about which port implies which protocol. Both ports serve
   // both, so pointing a client at the "wrong" one is no longer a failure.
@@ -413,6 +424,19 @@ async function main() {
 
   const root = await (await fetch(OL + "/")).text();
   check("ollama root says it is running", root === "Ollama is running", root);
+
+  // Debug logging reports sizes so a short reply can be traced back to a short
+  // request, but the message text itself must never reach the log.
+  const CANARY = "CANARY-DO-NOT-LOG-7391";
+  await post(OL + "/api/chat", {
+    model: "claude-opus-5",
+    messages: [{ role: "user", content: CANARY + " please answer" }],
+    stream: false,
+  });
+  check("debug log never contains message text", !server.log.includes(CANARY), "the prompt leaked into the log");
+  check("debug log reports request size", /body: [0-9]+ bytes/.test(server.log), "no body size line");
+  check("debug log reports prompt size", /prompt: from=[0-9]+ bytes=[0-9]+/.test(server.log), "no prompt size line");
+  check("debug log reports token usage", /tokens: prompt=[0-9]+/.test(server.log), "no token line");
 
   // The system prompt may carry client instructions and tool schemas, so the
   // debug log must show a length marker rather than the text itself.

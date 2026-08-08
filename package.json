@@ -10,6 +10,6 @@
   },
   "scripts": {
     "build": "node scripts/build-compose.mjs",
-    "test": "node test/gateway.test.mjs && node test/auth.test.mjs && node test/resume-fallback.test.mjs && node test/prune.test.mjs && node test/compose.test.mjs"
+    "test": "node test/gateway.test.mjs && node test/tools.test.mjs && node test/thinking.test.mjs && node test/auth.test.mjs && node test/resume-fallback.test.mjs && node test/prune.test.mjs && node test/compose.test.mjs"
   }
 }
