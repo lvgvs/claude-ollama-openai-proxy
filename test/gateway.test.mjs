@@ -133,7 +133,10 @@ async function main() {
   });
   const c1 = chat1.json.message.content;
   check("requested model reaches the CLI", c1.includes("MODEL=claude-opus-5"), c1);
-  check("built-in tools are disabled", c1.includes("TOOLSFLAG=[]"), c1);
+  // This proves the flag is sent, not that the CLI honours it. Whether the
+  // built-in tools are actually off can only be established against the real
+  // binary, by reading the tool list in its init message.
+  check("the tool-disabling flag is sent on every call", c1.includes("TOOLSFLAG=[]"), c1);
   check("first turn starts a fresh session", c1.includes("FRESH"), c1);
 
   const tagged = await post(OL + "/api/chat", {

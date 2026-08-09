@@ -431,6 +431,16 @@ services:
 
           // Disable the built-in tools. This gateway is a chat endpoint, not an agent:
           // text arriving from a client must never turn into command execution.
+          //
+          // Verified against Claude Code 2.1.224 in the container: the init message of
+          // a session started this way reports an empty tool list, and a prompt asking
+          // the model to run a shell command produces no tool_use block.
+          //
+          // --tools is variadic, so it swallows every following non-flag argument. A
+          // positional prompt placed after it is read as a tool name and the CLI then
+          // exits complaining that no input was given. Nothing here is at risk - the
+          // prompt travels over stdin and the next token is always another flag - but
+          // do not add a positional argument after this line.
           if (FLAGS.has("--tools")) args.push("--tools", "");
           else if (FLAGS.has("--disallowedTools")) args.push("--disallowedTools", "*");
 
