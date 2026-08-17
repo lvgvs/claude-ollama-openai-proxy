@@ -239,6 +239,16 @@ services:
       # prompt is replaced with a length marker before the arguments are shown.
       DEBUG: "1"
 
+      # PROMPT DUMP - off, and it should stay off.
+      # Every other setting here logs sizes and hashes on purpose. This one
+      # writes the exact text sent to the CLI - the client's system prompt and
+      # every message - to a file in the clear. It exists because some questions
+      # ("what is my client actually sending?") cannot be answered any other
+      # way. Turn it on for one debugging session, read the file, turn it off,
+      # delete the file. The container announces it loudly at startup while it
+      # is on.
+      # DEBUG_DUMP_PROMPT: "/home/node/state/prompt-dump.jsonl"
+
     healthcheck:
       test:
         - CMD

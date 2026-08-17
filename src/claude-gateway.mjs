@@ -123,6 +123,14 @@ const CFG = {
   contextLength: envInt("CONTEXT_LENGTH", 200000),
 
   debug: process.env.DEBUG === "1",
+
+  // Path to write the exact text handed to the CLI, or empty for off. This is
+  // the one setting that records message content in plaintext - everything else
+  // here logs sizes and hashes on purpose. It exists because some questions
+  // ("what is the client actually sending?") cannot be answered any other way.
+  // Turn it on for one debugging session on your own instance, read the file,
+  // turn it off, delete the file.
+  dumpPromptFile: process.env.DEBUG_DUMP_PROMPT || "",
 };
 
 // Both protocols are served on both ports, so the Ollama endpoints have to be
@@ -328,6 +336,30 @@ function redactArgs(args) {
 }
 
 /*
+ * Records one invocation verbatim, including message text, when
+ * DEBUG_DUMP_PROMPT names a file. Deliberately separate from dbg(): the debug
+ * log is safe to paste into an issue, this file is not.
+ */
+function dumpPrompt(opts) {
+  try {
+    fs.appendFileSync(
+      CFG.dumpPromptFile,
+      JSON.stringify({
+        at: new Date().toISOString(),
+        model: opts.model,
+        effort: opts.effort || "",
+        resumed: Boolean(opts.resume),
+        images: (opts.blocks || []).length,
+        systemPrompt: opts.systemPrompt || "",
+        prompt: opts.prompt || "",
+      }) + "\n"
+    );
+  } catch (e) {
+    log("Could not write the prompt dump:", e.message);
+  }
+}
+
+/*
  * Runs one claude invocation.
  *
  * Answer text arrives through onDelta, extended thinking through onThinking.
@@ -347,6 +379,7 @@ function runClaude(opts, onDelta, onThinking) {
   return new Promise((resolve, reject) => {
     const args = CFG.claudeBinArgs.concat(buildArgs(opts));
     dbg("spawn", CFG.claudeBin, JSON.stringify(redactArgs(args)));
+    if (CFG.dumpPromptFile) dumpPrompt(opts);
 
     let child;
     try {
@@ -2073,6 +2106,17 @@ function main() {
   log("Session continuity:", CFG.useSessions ? "on" : "off");
   log("Tool calling:", CFG.useToolCalls ? "on" : "off");
   log("Vision:", CFG.enableVision ? "on" : "off");
+  log("Thinking:", CFG.enableThinking ? "on" : "off");
+
+  // Loud on purpose, and not behind DEBUG: this is the one setting that writes
+  // conversation text to disk in the clear.
+  if (CFG.dumpPromptFile) {
+    log(
+      "WARNING: DEBUG_DUMP_PROMPT is on. Every prompt, including message text " +
+        "and the client's system prompt, is being written in plaintext to " +
+        CFG.dumpPromptFile + ". Turn it off and delete that file when you are done."
+    );
+  }
 
   const shutdown = () => {
     log("Shutting down...");

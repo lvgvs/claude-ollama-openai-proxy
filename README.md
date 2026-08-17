@@ -241,8 +241,21 @@ Everything is set through environment variables in `docker-compose.yaml`, which 
 | `API_KEYS` | *(unset)* | Comma-separated Bearer tokens. Guards every path on both ports — see [Authentication](#authentication) |
 | `PROTECT_OLLAMA` | `1` when `API_KEYS` is set | Set to `0` to leave `/api/...` open so Ollama clients still work |
 | `DEBUG` | `1` | Log every request and image hand-off |
+| `DEBUG_DUMP_PROMPT` | *(unset)* | Path to write the exact text sent to the CLI, message content and all. See below — leave it unset unless you are actively debugging |
 
 ---
+
+### Seeing what your client actually sends
+
+Every other diagnostic here reports sizes and hashes on purpose — the debug log is safe to paste into an issue. Some questions cannot be answered that way, though: *what is in my client's system prompt? what is it wrapping around my message?* `DEBUG_DUMP_PROMPT` answers those by writing the exact text handed to the CLI, one JSON record per turn, to a file you name:
+
+```bash
+DEBUG_DUMP_PROMPT: "/home/node/state/prompt-dump.jsonl"
+```
+
+Each record carries `model`, `effort`, `resumed`, `images`, `systemPrompt` and `prompt`. The container prints a loud warning at startup for as long as it is on.
+
+This is the one setting that puts conversation text on disk in the clear, so treat it as a temporary measure: turn it on, reproduce the thing you are chasing, read the file, turn it off, delete the file. It is unset by default and nothing writes it unless you name a path.
 
 ## How it works
 

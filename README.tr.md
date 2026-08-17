@@ -241,8 +241,21 @@ Her şey `docker-compose.yaml` içindeki ortam değişkenleriyle yapılır; dosy
 | `API_KEYS` | *(boş)* | Virgülle ayrılmış Bearer jetonları. İki porttaki her yolu korur — [Kimlik doğrulama](#kimlik-doğrulama) |
 | `PROTECT_OLLAMA` | `API_KEYS` varsa `1` | `0` yaparsan `/api/...` açık kalır, Ollama istemcileri çalışmaya devam eder |
 | `DEBUG` | `1` | Her isteği ve görsel aktarımını logla |
+| `DEBUG_DUMP_PROMPT` | *(boş)* | CLI'a giden metni, mesaj içeriği dahil, yazacağı dosya yolu. Aşağıya bak — aktif olarak hata ayıklamıyorsan boş bırak |
 
 ---
+
+### İstemcinin gerçekte ne gönderdiğini görmek
+
+Buradaki diğer tüm teşhis araçları bilinçli olarak yalnızca boyut ve özet basar — teşhis logunu bir hata kaydına yapıştırmak güvenlidir. Ama bazı sorular böyle cevaplanamıyor: *istemcimin sistem prompt'unda ne var? mesajımın etrafına ne sarıyor?* `DEBUG_DUMP_PROMPT` bunu, CLI'a giden metni tur başına bir JSON kaydı olarak belirttiğin dosyaya yazarak cevaplıyor:
+
+```bash
+DEBUG_DUMP_PROMPT: "/home/node/state/prompt-dump.jsonl"
+```
+
+Her kayıtta `model`, `effort`, `resumed`, `images`, `systemPrompt` ve `prompt` var. Açık olduğu sürece konteyner başlangıçta yüksek sesle uyarı basıyor.
+
+Konuşma metnini diske açık halde yazan tek ayar bu, o yüzden geçici bir önlem olarak davran: aç, aradığın durumu tekrarla, dosyayı oku, kapat, dosyayı sil. Varsayılan olarak boş ve sen bir yol vermedikçe hiçbir şey yazılmıyor.
 
 ## Nasıl çalışıyor
 

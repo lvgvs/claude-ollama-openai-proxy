@@ -4,6 +4,9 @@
  *
  *   node test/gateway.test.mjs
  */
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
 import { check, section, summary, startGateway, waitReady, post, postStream } from "./helpers.mjs";
 
 const OA = "http://127.0.0.1:13456";
@@ -241,12 +244,12 @@ async function main() {
   check("full replay emits previous_response tags", branched.json.message.content.includes("HASPREV"), branched.json.message.content);
 
   section("Streaming");
-  const os = await postStream(OL + "/api/chat", {
+  const olStream = await postStream(OL + "/api/chat", {
     model: "claude-opus-5",
     messages: [{ role: "user", content: "stream test" }],
     stream: true,
   });
-  const lines = os.text.trim().split("\n").filter(Boolean).map((l) => JSON.parse(l));
+  const lines = olStream.text.trim().split("\n").filter(Boolean).map((l) => JSON.parse(l));
   check("ollama stream sends multiple lines", lines.length >= 2, "lines=" + lines.length);
   check("ollama stream ends with done", lines[lines.length - 1].done === true);
   check("ollama stream sets done_reason", lines[lines.length - 1].done_reason === "stop");
@@ -453,6 +456,44 @@ async function main() {
   const usage = await (await fetch(OA + "/v1/usage")).json();
   check("session hits were recorded", usage.session.hits >= 2, JSON.stringify(usage.session));
   check("tool calls were counted", usage.toolCalls >= 3, "toolCalls=" + usage.toolCalls);
+
+  section("DEBUG_DUMP_PROMPT");
+  // The one setting that writes conversation text to disk. It has to stay off
+  // unless asked for, and it has to announce itself when it is on.
+  const dumpDir = fs.mkdtempSync(path.join(os.tmpdir(), "claude-proxy-dump-"));
+  const dumpFile = path.join(dumpDir, "prompts.jsonl");
+  const dumping = startGateway(
+    {
+      OPENAI_PORT: "13458",
+      OLLAMA_PORT: "21458",
+      CLAUDE_MODELS: "sonnet",
+      DEFAULT_CLAUDE_MODEL: "sonnet",
+      TRANSCRIPT_RETENTION_HOURS: "0",
+      DEBUG_DUMP_PROMPT: dumpFile,
+    },
+    "state-dump"
+  );
+  await waitReady("http://127.0.0.1:13458/health");
+  check("nothing is dumped by default", !fs.existsSync(dumpFile.replace("prompts", "never")), "sanity");
+  await post("http://127.0.0.1:13458/v1/chat/completions", {
+    model: "sonnet",
+    messages: [
+      { role: "system", content: "SYSTEM-MARKER-4821" },
+      { role: "user", content: "USER-MARKER-9174" },
+    ],
+    stream: false,
+  });
+  check("the dump file is written", fs.existsSync(dumpFile), dumpFile);
+  const dumped = fs.existsSync(dumpFile) ? JSON.parse(fs.readFileSync(dumpFile, "utf8").trim().split("\n")[0]) : {};
+  check("the system prompt is captured verbatim", dumped.systemPrompt === "SYSTEM-MARKER-4821", JSON.stringify(dumped.systemPrompt));
+  check("the user prompt is captured verbatim", dumped.prompt === "USER-MARKER-9174", JSON.stringify(dumped.prompt));
+  check("the model and effort are recorded", dumped.model === "sonnet" && "effort" in dumped, JSON.stringify(dumped));
+  check("turning it on is announced loudly", dumping.log.includes("DEBUG_DUMP_PROMPT is on"), dumping.log.slice(-300));
+  dumping.child.kill();
+  fs.rmSync(dumpDir, { recursive: true, force: true });
+
+  // The default server never had it set, so none of its prompts were recorded.
+  check("the default configuration writes no dump", !server.log.includes("DEBUG_DUMP_PROMPT is on"), "it announced itself without being asked");
 
   const failed = summary(server.log);
   server.child.kill();
