@@ -182,6 +182,8 @@ Ollama istemcileri bunun yerine `"options": { "reasoning_effort": "max" }` kulla
 
 Her model her seviyeyi desteklemez, ama desteklenmeyen bir seviye **hata vermez** — sessizce kırpılır ya da yok sayılır. Bu yüzden listedeki her kombinasyon güvenle durabilir.
 
+**Efor bir tavandır, tetikleyici değil.** Modelin düşünmesine izin verir, düşünmesini sağlamaz. Düşünüp düşünmeyeceğine model karar verir ve sıradan soruların çoğu hiçbir seviyede düşünme üretmez. Bir kurulumda 213 tur üzerinden ölçüldü: `haiku` turların yaklaşık %90'ında düşündü — üstelik **efor bayrağı hiç yokken**; `opus` `max` ile 15 turda hiç, `sonnet` 162 turda hiç düşünmedi. Kontrollü çiftte sistem prompt'u da soru da birebir aynıydı. Opus doğrudan CLI üzerinden sürüldüğünde düşünme üretiyor, yani bu ağ geçidinin bir hatası değil, modelin ve prompt'un bir özelliği — ama sonuç şu: **daha büyük model ve daha yüksek efor seçmek görünür akıl yürütme elde etmenin yolu değil.** Düşünmeyi görmek istiyorsan güvenilir olan `haiku`.
+
 **Eforun bedeli.** Yüksek seviye daha fazla düşünme satın alır ve düşünme çıktı olarak faturalanır. `opus:max` mevcut en pahalı kombinasyon ve bir açılır listede seçili bırakılıp unutulması çok kolay. Bu senin için önemliyse `/v1/usage`'ı takip et.
 
 ---
@@ -192,7 +194,7 @@ Her model her seviyeyi desteklemez, ama desteklenmeyen bir seviye **hata vermez*
 - **Aboneliğinin eriştiği tüm Claude modelleri**, takma adla ya da tam adla
 - **Efor seçimi**, istek bazında ya da model listesinden
 - **Function calling**, hem OpenAI hem Ollama biçiminde; araç sonuçları konuşmaya geri besleniyor
-- **Düşünme (thinking) ayrı alanda teslim ediliyor**: OpenAI tarafında `reasoning_content`, Ollama tarafında `message.thinking`. Cevabın içine asla karışmıyor; alanı tanımayan istemci onu yok sayar.
+- **Düşünme (thinking) ayrı alanda teslim ediliyor.** OpenAI tarafında hem `reasoning_content` hem `reasoning` gönderiliyor — aynı şey için iki isim dolaşımda ve istemciler tanımadıkları alanı sessizce düşürüyor, o yüzden ikisi birden. Ollama tarafında `message.thinking`, `/api/show` içinde `thinking` yeteneği ilan ediliyor ve `think` istek alanı destekleniyor: `false` düşünmeyi tamamen kapatır, seviye (`low`, `medium`, `high`, `max`) eforu belirler. Düşünme cevabın içine asla karışmıyor.
 - **Görsel girdi** (png, jpeg, gif, webp), gerçek görsel bloğu olarak iletiliyor
 - **Konuşma devamlılığı** — mesaj geçmişinin parmak izi alınıp Claude Code oturumuna eşleniyor, böylece her turda yalnızca yeni mesaj gönderiliyor. Bu, prompt caching'i devreye sokar; uzun sohbetlerde gecikmeyi ve kota tüketimini belirgin şekilde düşürür.
 - **Yerleşik araçlar kapalı**, istemci metni konteynerde komut çalıştıramaz
@@ -210,6 +212,8 @@ Her model her seviyeyi desteklemez, ama desteklenmeyen bir seviye **hata vermez*
 ## Bilinen pürüzler
 
 - **Uzun bir mesaj modele ortası eksik ulaşabilir.** Ağ geçidi hiçbir yerde kırpma yapmaz — ama modelin context penceresini keşfedemeyen Ollama istemcileri küçük bir varsayılan (çoğunlukla 2048 ya da 4096) kabul edip konuşmayı kendileri kırpar, genelde ortadan atarak. Context uzunluğu artık istemcilerin baktığı bilinen her yerde ilan ediliyor (`/api/show` içinde `parameters` ve `model_info`, `/api/tags` içinde `details`, `/v1/models` içinde `context_window` / `max_model_len`) ve `CONTEXT_LENGTH` bu değeri belirliyor. Ama bir istemcinin bunlardan herhangi birini okuduğunun garantisini bu taraf veremez. Uzun mesajlar hâlâ yarım cevaplanıyorsa `DEBUG` açıp `body: N bytes` satırını gönderdiğin boyutla karşılaştır: istek zaten kısa geldiyse kırpan istemcidir ve çözüm istemcinin ayarlarındadır.
+- **Konuşma devamlılığı, istemcinin cevaplarını değiştirmeden geri göndermesine bağlı.** Ağ geçidi oturumu yeniden bulmak için mesaj geçmişinin parmak izini alır; istemci modelin söylediğinin kısaltılmış ya da yeniden yazılmış bir halini geri gönderirse parmak izi tutmaz ve tüm geçmiş yeniden oynatılır. Bu, teşhis logunda görünür: asistan mesajları tam uzunlukta geri gelen turlar `session=hit`, kısaltılmış gelenler her seferinde `session=miss` yazar. Bu taraftan düzeltilemez — çözüm istemcidedir.
+- **Kendi araç çağırma yöntemini kullanan bir istemci buradaki tool-call mekanizmasına hiç uğramaz.** Bazı istemciler `tools` alanını hiç kullanmaz; araçlarını kendi sistem prompt'larının içinde tarif edip cevabı kendileri ayrıştırır. Yukarıdaki **Function calling** ile ilgili her şey yalnızca `tools` gönderen istemciler için geçerlidir; diğerleri için ağ geçidi sadece metin taşır ve istemci kaç araç çalıştırırsa çalıştırsın `/v1/usage` içindeki `toolCalls` sıfırda kalır.
 - **`TOOL_CALL_EARLY_STOP` yeni ve varsayılanı açık.** Araç çağrısı tamamlanır tamamlanmaz CLI'ı sonlandırmak, modelin araç sonuçlarını uydurmasını engelliyor — boşa giden çıktının büyük kısmı oradan geliyordu. Bu davranışı taklit eden bir stub'a karşı test edildi, uzun süren gerçek bir sohbete karşı değil. Araç kullanan sohbetlerde devamlılık bozulmaya başlarsa `"0"` yap; uydurma metin yine atılır, sadece bedeli ödenir. O turun token'ları nihai sonuç mesajı yerine akış olaylarından okunduğu için sayaçlar her iki durumda da doğru kalır.
 - **`ENABLE_SESSIONS: "0"` devamlılığı kapatır ama kayıt yazmayı kapatmaz.** Bu ayar yalnızca ağ geçidinin oturum devam ettirmesini engeller; CLI'ya hâlâ bir oturum kimliği verildiği için konuşma yine diske yazılır. Diskte daha az dosya istiyorsan bunun yerine `TRANSCRIPT_RETENTION_HOURS` değerini düşür.
 - Konuşma devamlılığı "elinden geleni yapar" mantığında. Bir mesajı düzenlemek ya da yeniden ürettirmek doğru şekilde yeni oturum açar; bunun bedeli bir kerelik tam geçmiş tekrarıdır.
@@ -230,6 +234,7 @@ Her şey `docker-compose.yaml` içindeki ortam değişkenleriyle yapılır; dosy
 | `ENABLE_SESSIONS` | `1` | Konuşma devamlılığı |
 | `TRANSCRIPT_RETENTION_HOURS` | `72` | Bu süreden eski oturum kayıtlarını sil; `0` hiç silmez |
 | `ENABLE_TOOL_CALLS` | `1` | Function calling |
+| `ENABLE_THINKING` | `1` | `thinking` yeteneğini ilan et ve düşünmeyi kendi alanında gönder. `0` bunu susturur ve `think` alanını etkisiz kılar; efor seviyesine her iki durumda da dokunmaz |
 | `TOOL_CALL_EARLY_STOP` | `1` | Tam araç çağrısı okunur okunmaz CLI'ı sonlandır, model sonuçları uyduramasın. `0` bitmesine izin verir; uydurma metin her hâlükârda atılır |
 | `CONTEXT_LENGTH` | `200000` | İstemcilere ilan edilen context penceresi. Yalnızca bir istemci gerçek değerle sorun çıkarırsa düşür |
 | `ENABLE_VISION` | `1` | Görsel girdi ve ilan edilen vision yeteneği |

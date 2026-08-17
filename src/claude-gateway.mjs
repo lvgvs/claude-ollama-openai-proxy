@@ -89,6 +89,13 @@ const CFG = {
   // invented text is still discarded, it is just paid for.
   toolCallEarlyStop: process.env.TOOL_CALL_EARLY_STOP !== "0",
 
+  // Extended thinking. Does two things, the same pair as vision: advertises
+  // the "thinking" capability so Ollama clients know to ask for it and show it,
+  // and forwards the thinking text in its own field. Turning it off silences
+  // both and makes the "think" request field a no-op; it does NOT touch the
+  // effort level, which is a separate axis.
+  enableThinking: process.env.ENABLE_THINKING !== "0",
+
   // Image support does two things: advertises the "vision" capability so
   // clients send images as message content, and forwards those images to the
   // CLI as real image blocks. No tool is enabled for this.
@@ -790,13 +797,24 @@ function resolveModel(requested) {
   return { model: CFG.defaultModel, effort };
 }
 
-// Per-request effort: explicit body field beats the model tag beats the default.
-// OpenAI clients use reasoning_effort, Ollama clients use options.reasoning_effort.
+/*
+ * Per-request effort: explicit body field beats the model tag beats the default.
+ * OpenAI clients use reasoning_effort, Ollama clients use
+ * options.reasoning_effort, and Ollama's own thinking control is the "think"
+ * field - whose levels are the same vocabulary as ours, so it maps straight
+ * across with no translation.
+ *
+ * think:false is stronger than "no preference": the client is saying the model
+ * should not think at all, so the effort flag is dropped even if the model tag
+ * asked for one.
+ */
 function effortFor(body, fromModelTag) {
+  if (body.think === false) return "";
   const explicit =
     normalizeEffort(body.reasoning_effort) ||
     normalizeEffort(body.effort) ||
-    normalizeEffort(body.options && body.options.reasoning_effort);
+    normalizeEffort(body.options && body.options.reasoning_effort) ||
+    normalizeEffort(body.think);
   return explicit || fromModelTag || "";
 }
 
@@ -1278,6 +1296,11 @@ async function chatTurn(body, onDelta, onThinking) {
   const model = target.model;
   const effort = effortFor(body, target.effort);
 
+  // Ollama's "think" field is how a client switches thinking off. When it does,
+  // nothing is streamed and nothing is returned - and effortFor has already
+  // dropped the effort flag, so the model does not spend the tokens either.
+  const wantsThinking = CFG.enableThinking && body.think !== false;
+
   const messages = normalizeMessages(body.messages);
   const totalImages = messages.reduce((a, m) => a + m.images.length, 0);
   const droppedMedia = messages.reduce((a, m) => a + m.droppedMedia, 0);
@@ -1372,7 +1395,7 @@ async function chatTurn(body, onDelta, onThinking) {
           watchToolCalls: schemas.length > 0 && CFG.toolCallEarlyStop,
         },
         forward,
-        onThinking
+        wantsThinking ? onThinking : null
       );
     };
 
@@ -1439,7 +1462,7 @@ async function chatTurn(body, onDelta, onThinking) {
 
   return {
     text: reply.text,
-    thinking: result.thinking || "",
+    thinking: wantsThinking ? result.thinking || "" : "",
     // Text the gate held back that turned out not to be a tool call, and so has
     // not been streamed yet. When it WAS a tool call the held text is the call
     // itself and must never be sent.
@@ -1524,6 +1547,18 @@ function openaiToolCalls(calls) {
   }));
 }
 
+/*
+ * Two names are in circulation for the same thing on OpenAI-compatible APIs:
+ * "reasoning_content", which DeepSeek introduced and vLLM followed, and
+ * "reasoning", which is what OpenAI's own guidance uses and where vLLM has
+ * since moved. Clients decode responses against strict schemas and silently
+ * drop any key they do not declare, so a provider that picks one name loses the
+ * thinking entirely for half the ecosystem. Both are sent.
+ */
+function reasoningFields(text) {
+  return { reasoning_content: text, reasoning: text };
+}
+
 function usageBlock(usage) {
   const i = promptTokens(usage);
   const o = (usage && usage.output_tokens) || 0;
@@ -1547,7 +1582,7 @@ async function handleOpenAiChat(req, res, body) {
       : { role: "assistant", content: out.text };
     // Thinking travels in its own field, never inside content. Clients that do
     // not know it ignore it; clients that do render it separately.
-    if (out.thinking) message.reasoning_content = out.thinking;
+    if (out.thinking) Object.assign(message, reasoningFields(out.thinking));
     return sendJson(res, 200, {
       id: requestId,
       object: "chat.completion",
@@ -1596,7 +1631,7 @@ async function handleOpenAiChat(req, res, body) {
         sentText = true;
       },
       (thought) => {
-        send(chunk(withRole({ reasoning_content: thought })));
+        send(chunk(withRole(reasoningFields(thought))));
       }
     );
 
@@ -1680,7 +1715,9 @@ async function handleOllamaChat(req, res, body, isGenerate) {
     const msgs = [];
     if (body.system) msgs.push({ role: "system", content: body.system });
     msgs.push({ role: "user", content: body.prompt || "", images: body.images });
-    payload = { model: body.model, messages: msgs, tools: body.tools, options: body.options };
+    // "think" has to come along, or thinking works on /api/chat and silently
+    // does nothing on /api/generate.
+    payload = { model: body.model, messages: msgs, tools: body.tools, options: body.options, think: body.think };
   }
 
   const wrap = (text, done, extra) => {
@@ -1920,7 +1957,12 @@ async function handleRequest(req, res) {
       },
       capabilities: ["completion"]
         .concat(CFG.useToolCalls ? ["tools"] : [])
-        .concat(CFG.enableVision ? ["vision"] : []),
+        .concat(CFG.enableVision ? ["vision"] : [])
+        // Ollama clients decide whether to ask for and render thinking from
+        // this list. Sending the thinking field without advertising it here is
+        // the same mistake as sending images to a client that never learned the
+        // model could see them.
+        .concat(CFG.enableThinking ? ["thinking"] : []),
     });
   }
 

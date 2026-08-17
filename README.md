@@ -182,6 +182,8 @@ With `EFFORT_TAGS` set (the default), every effort variant also appears in the c
 
 Not every model supports every level, but an unsupported level does **not** produce an error — it is silently clamped or ignored, so every combination in the list is safe to keep.
 
+**Effort is a ceiling, not a trigger.** It permits the model to think; it does not make it. Whether any thinking happens is the model's decision, and most ordinary questions produce none at any level. Measured on one deployment over 213 turns: `haiku` produced thinking on about 90% of turns *with no effort flag at all*, while `opus` at `max` produced it on none of 15 and `sonnet` on none of 162 — with an identical system prompt and an identical question in the controlled pair. Opus does emit thinking when driven directly through the CLI, so this is a property of the model and the prompt rather than a fault in the gateway, but it does mean **selecting a bigger model and a higher effort is not a way to get visible reasoning.** If you want to see thinking, `haiku` is the reliable one.
+
 **What effort costs.** A higher level buys more thinking, and thinking is billed as output. `opus:max` is the most expensive combination available and it is easy to leave selected in a dropdown and forget about. Watch `/v1/usage` if that matters to you.
 
 ---
@@ -192,7 +194,7 @@ Not every model supports every level, but an unsupported level does **not** prod
 - **All Claude models** your subscription can reach, via aliases or exact ids
 - **Reasoning effort** selection, per request or per model entry
 - **Function calling** in both OpenAI and Ollama shapes, including tool results fed back into the conversation
-- **Extended thinking delivered separately**, as `reasoning_content` on the OpenAI side and `message.thinking` on the Ollama side. It never appears inside the answer. Clients that do not understand the field ignore it.
+- **Extended thinking delivered separately.** On the OpenAI side it is sent as both `reasoning_content` and `reasoning` — two names are in circulation for the same thing and clients silently drop whichever they do not declare, so both are sent. On the Ollama side it is `message.thinking`, the `thinking` capability is advertised on `/api/show`, and the `think` request field is honoured: `false` turns thinking off entirely, and a level (`low`, `medium`, `high`, `max`) sets the effort. Thinking never appears inside the answer.
 - **Image input** (png, jpeg, gif, webp) forwarded as real image blocks
 - **Conversation continuity** — the message history is fingerprinted and mapped to a Claude Code session, so only the new message is sent each turn. This engages prompt caching and cuts latency and quota use substantially in long chats.
 - **Built-in tools disabled**, so client text cannot execute commands in the container
@@ -210,6 +212,8 @@ Not every model supports every level, but an unsupported level does **not** prod
 ## Known rough edges
 
 - **A long message can arrive at the model with its middle missing.** The gateway never truncates anything — but Ollama clients that cannot discover the model's context window assume a small default (2048 or 4096 is common) and trim the conversation themselves to fit, usually by dropping the middle. The context window is now published in every place a client is known to look (`/api/show` `parameters` and `model_info`, `/api/tags` `details`, and `context_window` / `max_model_len` on `/v1/models`), and `CONTEXT_LENGTH` sets the advertised value. Whether a given client reads any of them is not something this side of the wire can guarantee. If long messages still come back half-answered, turn `DEBUG` on and compare the `body: N bytes` line with the size you sent: if the request was already short, the client trimmed it and the fix belongs in the client's settings.
+- **Conversation continuity depends on the client echoing your replies back unchanged.** The gateway fingerprints the message history to find the session again; if the client sends back a shortened or rewritten version of what the model said, the fingerprint cannot match and the whole history is replayed. This is visible in the debug log: turns whose assistant messages come back at full length show `session=hit`, and turns where they come back truncated show `session=miss` every time. Nothing on this side can fix that — the fix is in the client.
+- **A client that does its own tool calling never reaches the tool-call machinery here.** Some clients ignore the `tools` field entirely and instead describe their tools inside the system prompt, then parse the reply themselves. Everything under **Function calling** above applies only to clients that send `tools`; for the others the gateway is just relaying text, and `toolCalls` in `/v1/usage` stays at zero no matter how many tools the client actually ran.
 - **`TOOL_CALL_EARLY_STOP` is new and defaults to on.** Killing the CLI the moment a tool call is complete stops the model inventing tool results, which is where a lot of wasted output came from. It has been tested against a stub that reproduces the behaviour, not against a long-running real conversation. If tool-using chats start losing continuity, set it to `"0"`; the invented text is still discarded, it is just paid for. The tokens that turn is billed are read from the streaming events rather than the final result message, so the counters stay accurate either way.
 - **`ENABLE_SESSIONS: "0"` turns off continuity but not transcript writing.** The setting stops the gateway from resuming sessions; the CLI is still given a session id, so it still records the conversation. If you want fewer files on disk, lower `TRANSCRIPT_RETENTION_HOURS` instead.
 - Conversation continuity is best-effort. Editing or regenerating a message correctly starts a new session, which costs one full history replay.
@@ -230,6 +234,7 @@ Everything is set through environment variables in `docker-compose.yaml`, which 
 | `ENABLE_SESSIONS` | `1` | Conversation continuity |
 | `TRANSCRIPT_RETENTION_HOURS` | `72` | Delete session transcripts older than this; `0` keeps them forever |
 | `ENABLE_TOOL_CALLS` | `1` | Function calling |
+| `ENABLE_THINKING` | `1` | Advertise the `thinking` capability and deliver thinking in its own field. `0` silences it and makes `think` a no-op; the effort level is untouched either way |
 | `TOOL_CALL_EARLY_STOP` | `1` | Kill the CLI as soon as a complete tool call has been read, so the model cannot invent the results. `0` lets it finish; the invented text is discarded either way |
 | `CONTEXT_LENGTH` | `200000` | Context window advertised to clients. Lower it only if a client misbehaves with the real figure |
 | `ENABLE_VISION` | `1` | Image input and the advertised vision capability |

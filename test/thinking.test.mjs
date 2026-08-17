@@ -125,8 +125,94 @@ async function main() {
   const promptLen = parseInt((followUp.match(/PROMPTLEN=([0-9]+)/) || [])[1] || "0", 10);
   check("only the new message is replayed", promptLen === "and now the follow-up".length, "promptlen=" + promptLen);
 
-  const failed = summary(server.log);
+  section("The capability is advertised");
+  // A client decides whether to ask for and render thinking from this list.
+  // Sending the field without advertising it is how thinking can be delivered
+  // correctly and still never appear on screen.
+  const show = await post(OL + "/api/show", { model: "sonnet" });
+  check("api/show advertises thinking", show.json.capabilities.includes("thinking"), JSON.stringify(show.json.capabilities));
+
+  section("Both OpenAI field names are sent");
+  // Clients decode with strict schemas and drop keys they do not declare, so
+  // picking one name loses the thinking for half the ecosystem.
+  check("reasoning is sent alongside reasoning_content", msg.reasoning === THOUGHT, JSON.stringify(msg.reasoning));
+  const streamedReasoning = deltas.map((d) => d.reasoning || "").join("");
+  check("reasoning streams too", streamedReasoning === THOUGHT, JSON.stringify(streamedReasoning));
+
+  section("The client can switch thinking off");
+  const off = await post(OL + "/api/chat", {
+    model: "sonnet",
+    stream: false,
+    think: false,
+    messages: [{ role: "user", content: "THINKTEST riddle" }],
+  });
+  check("think:false returns no thinking", !off.json.message.thinking, JSON.stringify(off.json.message.thinking));
+  check("the answer is unaffected", off.json.message.content === ANSWER, JSON.stringify(off.json.message.content));
+  // The stub echoes the flags it was given, so this proves the model was never
+  // asked to think in the first place rather than thinking and being censored.
+  const offEffort = await post(OL + "/api/chat", {
+    model: "sonnet:high",
+    stream: false,
+    think: false,
+    messages: [{ role: "user", content: "flags please" }],
+  });
+  check("think:false drops the effort flag as well", offEffort.json.message.content.includes("EFFORT=[]"), offEffort.json.message.content);
+
+  section("The think field carries a level");
+  const level = await post(OL + "/api/chat", {
+    model: "sonnet",
+    stream: false,
+    think: "high",
+    messages: [{ role: "user", content: "flags please" }],
+  });
+  check("think level becomes the effort", level.json.message.content.includes("EFFORT=[high]"), level.json.message.content);
+
+  const onTrue = await post(OL + "/api/chat", {
+    model: "sonnet",
+    stream: false,
+    think: true,
+    messages: [{ role: "user", content: "THINKTEST riddle" }],
+  });
+  check("think:true keeps thinking on", onTrue.json.message.thinking === THOUGHT, JSON.stringify(onTrue.json.message.thinking));
+
+  // /api/generate rebuilds the request from scratch, so "think" is easy to drop
+  // there while /api/chat keeps working.
+  const genOff = await post(OL + "/api/generate", {
+    model: "sonnet",
+    stream: false,
+    think: false,
+    prompt: "THINKTEST riddle",
+  });
+  check("generate honours think:false", !genOff.json.thinking, JSON.stringify(genOff.json.thinking));
+
   server.child.kill();
+
+  section("ENABLE_THINKING=0 silences it everywhere");
+  const quiet = startGateway(
+    {
+      OPENAI_PORT: "14400",
+      OLLAMA_PORT: "22400",
+      CLAUDE_MODELS: "sonnet",
+      DEFAULT_CLAUDE_MODEL: "sonnet",
+      TRANSCRIPT_RETENTION_HOURS: "0",
+      ENABLE_THINKING: "0",
+    },
+    "state-thinking-off"
+  );
+  await waitReady("http://127.0.0.1:14400/health");
+  const quietShow = await post("http://127.0.0.1:22400/api/show", { model: "sonnet" });
+  check("the capability is withdrawn", !quietShow.json.capabilities.includes("thinking"), JSON.stringify(quietShow.json.capabilities));
+  const quietChat = await post("http://127.0.0.1:14400/v1/chat/completions", {
+    model: "sonnet",
+    stream: false,
+    messages: [{ role: "user", content: "THINKTEST riddle" }],
+  });
+  const quietMsg = quietChat.json.choices[0].message;
+  check("no thinking is returned", !quietMsg.reasoning && !quietMsg.reasoning_content, quietChat.text.slice(0, 300));
+  check("the answer still arrives", quietMsg.content === ANSWER, JSON.stringify(quietMsg.content));
+  quiet.child.kill();
+
+  const failed = summary(server.log);
   process.exit(failed ? 1 : 0);
 }
 

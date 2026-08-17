@@ -152,6 +152,36 @@ services:
       # OpenAI/Ollama style function calling (the client's own tools).
       ENABLE_TOOL_CALLS: "1"
 
+      # Stop the model inventing tool results. There is no stop-sequence, so
+      # after writing a tool call the model carries on and makes up what the
+      # tool returned - tokens that are billed and then thrown away. With this
+      # on, the CLI is killed as soon as a complete call has been read.
+      # Set to "0" to let it finish instead; the invented text is discarded
+      # either way, it is just paid for.
+      TOOL_CALL_EARLY_STOP: "1"
+
+      # EXTENDED THINKING. Same pair of jobs as vision:
+      #   1) Advertises the "thinking" capability, which is how an Ollama client
+      #      decides whether to ask for thinking and show it. A client that does
+      #      not see it will never display any, however correctly it is sent.
+      #   2) Delivers the thinking text in its own field - reasoning_content AND
+      #      reasoning on the OpenAI side (two names are in circulation and
+      #      clients drop the one they do not know), message.thinking on the
+      #      Ollama side. It never appears inside the answer.
+      # The Ollama "think" request field is honoured: false turns thinking off
+      # and drops the effort flag with it, a level (low/medium/high/max) sets
+      # the effort.
+      # NOTE: effort is a ceiling, not a trigger. It lets the model think, it
+      # does not make it. Most ordinary questions produce no thinking at any
+      # level, and that is the model's decision, not this gateway's.
+      ENABLE_THINKING: "1"
+
+      # Context window advertised to clients. The gateway never truncates
+      # anything, but a client that cannot discover a context length assumes a
+      # small default (2048 or 4096 is common) and quietly drops the middle of a
+      # long conversation to fit it.
+      CONTEXT_LENGTH: "200000"
+
       # IMAGE SUPPORT. Does two things:
       #   1) Advertises the "vision" capability. Clients that do not see it will
       #      not send images at all and fall back to their own file tools.

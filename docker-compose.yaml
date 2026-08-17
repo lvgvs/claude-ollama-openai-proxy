@@ -122,6 +122,36 @@ services:
       # OpenAI/Ollama style function calling (the client's own tools).
       ENABLE_TOOL_CALLS: "1"
 
+      # Stop the model inventing tool results. There is no stop-sequence, so
+      # after writing a tool call the model carries on and makes up what the
+      # tool returned - tokens that are billed and then thrown away. With this
+      # on, the CLI is killed as soon as a complete call has been read.
+      # Set to "0" to let it finish instead; the invented text is discarded
+      # either way, it is just paid for.
+      TOOL_CALL_EARLY_STOP: "1"
+
+      # EXTENDED THINKING. Same pair of jobs as vision:
+      #   1) Advertises the "thinking" capability, which is how an Ollama client
+      #      decides whether to ask for thinking and show it. A client that does
+      #      not see it will never display any, however correctly it is sent.
+      #   2) Delivers the thinking text in its own field - reasoning_content AND
+      #      reasoning on the OpenAI side (two names are in circulation and
+      #      clients drop the one they do not know), message.thinking on the
+      #      Ollama side. It never appears inside the answer.
+      # The Ollama "think" request field is honoured: false turns thinking off
+      # and drops the effort flag with it, a level (low/medium/high/max) sets
+      # the effort.
+      # NOTE: effort is a ceiling, not a trigger. It lets the model think, it
+      # does not make it. Most ordinary questions produce no thinking at any
+      # level, and that is the model's decision, not this gateway's.
+      ENABLE_THINKING: "1"
+
+      # Context window advertised to clients. The gateway never truncates
+      # anything, but a client that cannot discover a context length assumes a
+      # small default (2048 or 4096 is common) and quietly drops the middle of a
+      # long conversation to fit it.
+      CONTEXT_LENGTH: "200000"
+
       # IMAGE SUPPORT. Does two things:
       #   1) Advertises the "vision" capability. Clients that do not see it will
       #      not send images at all and fall back to their own file tools.
@@ -314,6 +344,13 @@ services:
           // Set TOOL_CALL_EARLY_STOP to "0" to let the process finish instead; the
           // invented text is still discarded, it is just paid for.
           toolCallEarlyStop: process.env.TOOL_CALL_EARLY_STOP !== "0",
+
+          // Extended thinking. Does two things, the same pair as vision: advertises
+          // the "thinking" capability so Ollama clients know to ask for it and show it,
+          // and forwards the thinking text in its own field. Turning it off silences
+          // both and makes the "think" request field a no-op; it does NOT touch the
+          // effort level, which is a separate axis.
+          enableThinking: process.env.ENABLE_THINKING !== "0",
 
           // Image support does two things: advertises the "vision" capability so
           // clients send images as message content, and forwards those images to the
@@ -1016,13 +1053,24 @@ services:
           return { model: CFG.defaultModel, effort };
         }
 
-        // Per-request effort: explicit body field beats the model tag beats the default.
-        // OpenAI clients use reasoning_effort, Ollama clients use options.reasoning_effort.
+        /*
+         * Per-request effort: explicit body field beats the model tag beats the default.
+         * OpenAI clients use reasoning_effort, Ollama clients use
+         * options.reasoning_effort, and Ollama's own thinking control is the "think"
+         * field - whose levels are the same vocabulary as ours, so it maps straight
+         * across with no translation.
+         *
+         * think:false is stronger than "no preference": the client is saying the model
+         * should not think at all, so the effort flag is dropped even if the model tag
+         * asked for one.
+         */
         function effortFor(body, fromModelTag) {
+          if (body.think === false) return "";
           const explicit =
             normalizeEffort(body.reasoning_effort) ||
             normalizeEffort(body.effort) ||
-            normalizeEffort(body.options && body.options.reasoning_effort);
+            normalizeEffort(body.options && body.options.reasoning_effort) ||
+            normalizeEffort(body.think);
           return explicit || fromModelTag || "";
         }
 
@@ -1504,6 +1552,11 @@ services:
           const model = target.model;
           const effort = effortFor(body, target.effort);
 
+          // Ollama's "think" field is how a client switches thinking off. When it does,
+          // nothing is streamed and nothing is returned - and effortFor has already
+          // dropped the effort flag, so the model does not spend the tokens either.
+          const wantsThinking = CFG.enableThinking && body.think !== false;
+
           const messages = normalizeMessages(body.messages);
           const totalImages = messages.reduce((a, m) => a + m.images.length, 0);
           const droppedMedia = messages.reduce((a, m) => a + m.droppedMedia, 0);
@@ -1598,7 +1651,7 @@ services:
                   watchToolCalls: schemas.length > 0 && CFG.toolCallEarlyStop,
                 },
                 forward,
-                onThinking
+                wantsThinking ? onThinking : null
               );
             };
 
@@ -1665,7 +1718,7 @@ services:
 
           return {
             text: reply.text,
-            thinking: result.thinking || "",
+            thinking: wantsThinking ? result.thinking || "" : "",
             // Text the gate held back that turned out not to be a tool call, and so has
             // not been streamed yet. When it WAS a tool call the held text is the call
             // itself and must never be sent.
@@ -1750,6 +1803,18 @@ services:
           }));
         }
 
+        /*
+         * Two names are in circulation for the same thing on OpenAI-compatible APIs:
+         * "reasoning_content", which DeepSeek introduced and vLLM followed, and
+         * "reasoning", which is what OpenAI's own guidance uses and where vLLM has
+         * since moved. Clients decode responses against strict schemas and silently
+         * drop any key they do not declare, so a provider that picks one name loses the
+         * thinking entirely for half the ecosystem. Both are sent.
+         */
+        function reasoningFields(text) {
+          return { reasoning_content: text, reasoning: text };
+        }
+
         function usageBlock(usage) {
           const i = promptTokens(usage);
           const o = (usage && usage.output_tokens) || 0;
@@ -1773,7 +1838,7 @@ services:
               : { role: "assistant", content: out.text };
             // Thinking travels in its own field, never inside content. Clients that do
             // not know it ignore it; clients that do render it separately.
-            if (out.thinking) message.reasoning_content = out.thinking;
+            if (out.thinking) Object.assign(message, reasoningFields(out.thinking));
             return sendJson(res, 200, {
               id: requestId,
               object: "chat.completion",
@@ -1822,7 +1887,7 @@ services:
                 sentText = true;
               },
               (thought) => {
-                send(chunk(withRole({ reasoning_content: thought })));
+                send(chunk(withRole(reasoningFields(thought))));
               }
             );
 
@@ -1906,7 +1971,9 @@ services:
             const msgs = [];
             if (body.system) msgs.push({ role: "system", content: body.system });
             msgs.push({ role: "user", content: body.prompt || "", images: body.images });
-            payload = { model: body.model, messages: msgs, tools: body.tools, options: body.options };
+            // "think" has to come along, or thinking works on /api/chat and silently
+            // does nothing on /api/generate.
+            payload = { model: body.model, messages: msgs, tools: body.tools, options: body.options, think: body.think };
           }
 
           const wrap = (text, done, extra) => {
@@ -2146,7 +2213,12 @@ services:
               },
               capabilities: ["completion"]
                 .concat(CFG.useToolCalls ? ["tools"] : [])
-                .concat(CFG.enableVision ? ["vision"] : []),
+                .concat(CFG.enableVision ? ["vision"] : [])
+                // Ollama clients decide whether to ask for and render thinking from
+                // this list. Sending the thinking field without advertising it here is
+                // the same mistake as sending images to a client that never learned the
+                // model could see them.
+                .concat(CFG.enableThinking ? ["thinking"] : []),
             });
           }
 
