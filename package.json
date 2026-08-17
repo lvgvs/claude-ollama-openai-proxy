@@ -1,6 +1,6 @@
 {
   "name": "claude-code-cli-proxy",
-  "version": "1.1.1",
+  "version": "1.1.2",
   "description": "Exposes the Claude Code CLI as an Ollama-compatible and OpenAI-compatible API, in a single docker-compose file",
   "type": "module",
   "private": true,
